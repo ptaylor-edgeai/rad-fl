@@ -1,0 +1,26 @@
+{
+  "nodes": [
+    {"id": "pi-1",  "host": "127.0.0.1", "port": 9001},
+    {"id": "pi-2",  "host": "127.0.0.1", "port": 9002},
+    {"id": "pi-3",  "host": "127.0.0.1", "port": 9003},
+    {"id": "pi-4",  "host": "127.0.0.1", "port": 9004},
+    {"id": "pi-5",  "host": "127.0.0.1", "port": 9005},
+    {"id": "pi-6",  "host": "127.0.0.1", "port": 9006},
+    {"id": "pi-7",  "host": "127.0.0.1", "port": 9007},
+    {"id": "pi-8",  "host": "127.0.0.1", "port": 9008},
+    {"id": "pi-9",  "host": "127.0.0.1", "port": 9009},
+    {"id": "pi-10", "host": "127.0.0.1", "port": 9010}
+  ],
+  "links": [
+    { "source": "pi-1",  "target": "pi-2"  },
+    { "source": "pi-2",  "target": "pi-3"  },
+    { "source": "pi-3",  "target": "pi-4"  },
+    { "source": "pi-4",  "target": "pi-5"  },
+    { "source": "pi-5",  "target": "pi-6"  },
+    { "source": "pi-6",  "target": "pi-7"  },
+    { "source": "pi-7",  "target": "pi-8"  },
+    { "source": "pi-8",  "target": "pi-9"  },
+    { "source": "pi-9",  "target": "pi-10" },
+    { "source": "pi-10", "target": "pi-1"  }
+  ]
+}

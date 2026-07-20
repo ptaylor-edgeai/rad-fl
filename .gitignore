@@ -1,0 +1,17 @@
+# Build artifacts
+.build/
+
+# IDE / editor state — auto-generated from Package.swift, machine-specific.
+# Open Package.swift directly in Xcode to regenerate.
+.swiftpm/
+.idea/
+
+.DS_Store
+
+# Datasets and experiment output — tracked in a separate results repo.
+/data/
+/results/
+
+# Local-only artifacts / scratch, not part of the source tree.
+swiftly.pkg
+topology_debug.json
