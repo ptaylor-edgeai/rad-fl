@@ -128,7 +128,7 @@ explicitly: `SWIFT_SDK_TARGET=<triple> ./build-linux.sh`. Debug info is kept
 by default — pass `STRIP=1` for a smaller deployment artifact once you don't
 need symbolicated crashes for whatever you're currently debugging.
 
-## Known gaps
+## Known gaps (Future Work)
 
 - `bytes_received` in `RoundMetrics` is an unimplemented placeholder (`-1`) —
   the transport receive path doesn't track cumulative bytes yet.
