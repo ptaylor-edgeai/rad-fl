@@ -7,10 +7,54 @@
 // Fields intentionally mirror Python naming (snake_case in the CSV/JSONL output,
 // even though Swift convention is camelCase internally) so downstream analysis
 // scripts (pandas-based) don't need per-runtime column-name branching.
+//
+// ── Schema versioning and the sentinel convention (added at schema v2) ──────
+//
+// All experiments from here are Swift-only — the Python baseline is frozen as
+// submitted, so this struct is no longer constrained by cross-runtime column
+// parity. It IS still constrained by metrics.py/power_analysis.py, which read
+// these CSVs as analysis tools; those parse by column NAME and skip unknown
+// columns, so new fields are always APPENDED to the header, never inserted.
+//
+// Fields are being added ahead of the code that populates them, deliberately.
+// The alternative — adding columns mid-campaign as each feature lands — leaves
+// runs from the same campaign with different CSV shapes, which metrics.py then
+// has to branch on. Adding them now with an explicit "not instrumented"
+// sentinel keeps every run from this point forward structurally identical.
+//
+// SENTINEL CONVENTION, and it matters:
+//     -1   means NOT INSTRUMENTED — this build could not measure the value
+//      0   means MEASURED AS ZERO — a real observation
+//
+// These are NOT interchangeable. `peersTimedOut == 0` means the deadline was
+// active and nothing timed out (an RQ2 result); `peersTimedOut == -1` means no
+// deadline mechanism existed in the build that produced the row. Conflating
+// them turns "the topology was robust" into "we weren't measuring", which is
+// exactly the kind of silent ambiguity that ruins a robustness claim after the
+// cluster time has already been spent. Analysis code MUST filter -1 explicitly
+// rather than treating it as a numeric value; a mean over a column containing
+// -1 sentinels is meaningless.
+//
+// Schema history:
+//   v1 — original: Python-parity columns + node_id/condition/bytes_received/
+//        peers_reached/peers_expected/status.
+//   v2 — adds schema_version, the wire/payload byte split, peers_timed_out,
+//        compute_threads, achieved_freq_khz. All default to the -1 sentinel
+//        so existing call sites compile and run unchanged.
 
 import Foundation
 
 public struct RoundMetrics: Sendable, Codable {
+    /// Sentinel meaning "this build did not instrument this value". Distinct
+    /// from a measured zero — see the file header. Used as the default for
+    /// every field added after schema v1.
+    public static let notInstrumented: Int64 = -1
+
+    /// CSV/struct schema version. Bump when columns are added so analysis code
+    /// can dispatch on an explicit number rather than sniffing for the presence
+    /// of a column and guessing.
+    public static let schemaVersion: Int = 2
+
     public let round: Int
     public let nodeID: Int
     public let condition: String          // e.g. "alpha_0.1", "alpha_0.5", "iid"
@@ -71,6 +115,68 @@ public struct RoundMetrics: Sendable, Codable {
     public let peersReached: Int
     public let peersExpected: Int
 
+    // ── Communication, schema v2 ────────────────────────────────────────────
+    //
+    // The wire/payload split exists because of connect-per-push. Every gossip
+    // message pays a TCP handshake plus RAFD framing plus per-message headers
+    // on top of its tensor payload. At dense FP32 that overhead is a rounding
+    // error against a model-sized payload and nobody would notice. Under RQ1's
+    // compression mechanisms — top-k at k=1%, INT8 quantisation — the payload
+    // shrinks by one to two orders of magnitude while the fixed cost does not
+    // move at all, so the overhead can come to DOMINATE the transfer.
+    //
+    // Reporting only one figure gets this wrong in one of two ways: report
+    // payload alone and the compression saving is overstated, because the bytes
+    // that actually crossed the network didn't fall nearly as far; report wire
+    // alone and the mechanism's real effect on the tensor is invisible. RQ1's
+    // primary metric is bytes-to-target, so this is not a diagnostic nicety —
+    // getting it wrong misstates the headline result.
+    //
+    // The gap between them is itself a finding about this architecture, and one
+    // worth reporting: it quantifies what connect-per-push costs, and it is the
+    // evidence that would justify persistent connections if the numbers warrant.
+    //
+    // wire    = everything written to / read from the socket, framing included
+    // payload = serialised tensor bytes only
+    // Invariant when both are instrumented: wire >= payload.
+    public let wireBytesSent: Int64
+    public let wireBytesReceived: Int64
+    public let payloadBytesSent: Int64
+    public let payloadBytesReceived: Int64
+
+    /// Peers whose update did not arrive before the round deadline. Requires
+    /// the round-level peer deadline (currently RoundOrchestrator waits
+    /// indefinitely, so this is -1 until that lands). Distinct from
+    /// `peersExpected - peersReached`, which cannot tell a timeout apart from a
+    /// peer that was never reachable in the first place — a distinction RQ2's
+    /// churn and targeted-failure arms depend on.
+    public let peersTimedOut: Int
+
+    // ── Resource state, schema v2 ───────────────────────────────────────────
+
+    /// Compute width actually used by Tensor.swift's concurrentPerform calls.
+    ///
+    /// Recorded because libdispatch on Linux sizes its worker pool from
+    /// sysconf(_SC_NPROCESSORS_ONLN), which does NOT respect a cgroup cpuset —
+    /// so a node restricted to one CPU may still run four workers timeslicing
+    /// on that core. That is an oversubscribed workload with a materially
+    /// different cache profile from a genuine single-core device, and it would
+    /// silently corrupt every heterogeneity-profile comparison. Logging the
+    /// requested width per round makes the manipulation auditable from the data
+    /// rather than assumed from the launch command.
+    public let computeThreads: Int
+
+    /// CPU clock actually achieved, in kHz, from `vcgencmd measure_clock arm`
+    /// (NOT the requested scaling_max_freq).
+    ///
+    /// These differ under thermal throttling, and the direction of the error is
+    /// the damaging one: the fast profile is the one that throttles, so an
+    /// unlogged drop biases results AGAINST the high-frequency condition and
+    /// compresses the heterogeneity gradient. Pairs with `throttled` — that
+    /// field says whether a limit was hit at all, this one says what the clock
+    /// actually was when it happened.
+    public let achievedFreqKHz: Int
+
     // Pi hardware state (always "unavailable" on Mac) — Python's throttled column
     public let throttled: String
 
@@ -124,7 +230,25 @@ public struct RoundMetrics: Sendable, Codable {
         testLoss: Double?,
         localAcc: Double?,
         localLoss: Double?,
-        status: RoundStatus
+        status: RoundStatus,
+        // ── schema v2 ───────────────────────────────────────────────────────
+        // Appended at the END of the parameter list, with defaults, so every
+        // existing call site (RoundOrchestrator) compiles and runs unchanged.
+        // Inserting them next to their related v1 fields would have read more
+        // naturally but would break every caller, which is not worth it for
+        // parameters that are about to be filled in one at a time as each
+        // feature lands.
+        //
+        // Defaults are the -1 "not instrumented" sentinel, NOT 0 — see the
+        // file header. A default of 0 would be a lie: it would claim a
+        // measurement of zero for a quantity nothing measured.
+        wireBytesSent: Int64 = RoundMetrics.notInstrumented,
+        wireBytesReceived: Int64 = RoundMetrics.notInstrumented,
+        payloadBytesSent: Int64 = RoundMetrics.notInstrumented,
+        payloadBytesReceived: Int64 = RoundMetrics.notInstrumented,
+        peersTimedOut: Int = -1,
+        computeThreads: Int = -1,
+        achievedFreqKHz: Int = -1
     ) {
         self.round = round
         self.nodeID = nodeID
@@ -156,6 +280,13 @@ public struct RoundMetrics: Sendable, Codable {
         self.localAcc = localAcc
         self.localLoss = localLoss
         self.status = status
+        self.wireBytesSent = wireBytesSent
+        self.wireBytesReceived = wireBytesReceived
+        self.payloadBytesSent = payloadBytesSent
+        self.payloadBytesReceived = payloadBytesReceived
+        self.peersTimedOut = peersTimedOut
+        self.computeThreads = computeThreads
+        self.achievedFreqKHz = achievedFreqKHz
     }
 }
 
@@ -188,5 +319,6 @@ public struct PeerPushLogEntry: Sendable, Codable {
         self.timestamp = timestamp
     }
 }
+
 
 

@@ -118,7 +118,7 @@ struct RADFLMain {
                             scalar loops) that hasn't been verified against a real
                             compiler — this is the first real check of its correctness,
                             the same way test-cnn was for Tensor.swift's other primitives.)
-                           [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--output-dir <path>]
+                           [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--batch-size <n>] [--output-dir <path>]
                            (runs the FULL federated learning loop for real, on real
                             hardware: starts this node's GossipServer, loads its real
                             train/test shards via CIFAR10Shard, builds a SimpleCNN, and
@@ -149,14 +149,17 @@ struct RADFLMain {
                             used both to find the shard directory (--data-dir/<condition>/)
                             and as part of the output path. ALL output for this run
                             (RoundMetrics CSV, peer_push_log.jsonl, saved final weights as
-                            conv1W/conv1B/conv2W/conv2B/conv3W/conv3B/fcW/fcB.npy, and config.json recording the exact
-                            SimpleCNNConfig used) is written under
+                            conv1W/conv1B/conv2W/conv2B/conv3W/conv3B/fcW/fcB.npy, config.json recording the exact
+                            SimpleCNNConfig used, and run_config.json recording the FULL
+                            invocation — seed, rounds, lr, batch size, topology mode, shard
+                            counts, git commit, and CPU governor/frequency state at start)
+                            is written under
                             --output-dir/<node-id>/<condition>/ (default --output-dir:
-                            "results"), e.g. results/pi-1/alpha_0p5/. Some RoundMetrics
-                            fields (effective_cores, peak_rss_bytes, bytes_sent,
-                            bytes_received) are PLACEHOLDER VALUES (-1) in this version —
-                            see RoundOrchestrator.swift for why. Defaults: 5 rounds,
-                            learning rate 0.01.)
+                            "results"), e.g. results/pi-1/peq_alpha_0p1/. Some RoundMetrics
+                            fields are PLACEHOLDER VALUES (-1) in this version — the -1
+                            sentinel means NOT INSTRUMENTED, explicitly distinct from a
+                            measured zero; see RoundMetrics.swift. Defaults: 5 rounds,
+                            learning rate 0.01, batch size 32, seed 42.)
             """)
             return
         }
@@ -484,6 +487,16 @@ struct RADFLMain {
                 // default was originally tuned against).
                 let learningRate = Float(arg("--learning-rate", in: args) ?? "0.01") ?? 0.01
                 let seed = UInt64(arg("--seed", in: args) ?? "42") ?? 42
+                // Batch size was previously hardcoded to 32 at the
+                // SimpleCNNConfig(n:) call site below. Exposed as a flag
+                // because it is a real resource knob, not just a
+                // hyperparameter: it trades peak RSS against throughput, and
+                // it is the only knob available that moves the memory axis —
+                // which makes it a required factor in the single-node knob
+                // characterisation and in the memory-envelope work. The
+                // default is unchanged at 32, so every existing invocation
+                // behaves exactly as before.
+                let batchSize = Int(arg("--batch-size", in: args) ?? "32") ?? 32
                 let outputBaseStr = arg("--output-dir", in: args) ?? "results"
 
                 // Single shared output directory for EVERYTHING this run
@@ -556,10 +569,10 @@ struct RADFLMain {
                     try await group.shutdownGracefully()
                     return
                 }
-                // batch size for SimpleCNN's config — reuses the same default
-                // batch size CNNTrainer/train-cnn use elsewhere in this file,
-                // not exposed as a separate run-round flag in this version.
-                let modelConfig = SimpleCNNConfig(n: 32)
+                // batch size for SimpleCNN's config — now from --batch-size
+                // (default 32, matching the previous hardcoded value and
+                // CNNTrainer/train-cnn's own default elsewhere in this file).
+                let modelConfig = SimpleCNNConfig(n: batchSize)
                 let model = SimpleCNN(config: modelConfig, seed: seed)
 
                 let collector = InboundUpdateCollector()
@@ -682,6 +695,63 @@ struct RADFLMain {
                 let configData = try JSONEncoder().encode(modelConfig)
                 try configData.write(to: configURL, options: .atomic)
                 print("[run-round] model config saved to \(configURL.path)")
+
+                // run_config.json — the FULL record of this invocation, written
+                // alongside config.json and for the same reason (before
+                // training, so an interrupted run still describes itself).
+                //
+                // config.json records the architecture only. That is enough to
+                // reload weights and not enough to reproduce a run: seed,
+                // learning rate, rounds, topology mode, which shards were
+                // loaded, which binary was running, and what the CPU governor
+                // was doing are all absent from it. Without those, a set of
+                // completed runs cannot be told apart by seed, cannot confirm
+                // which governor was in effect, and cannot be traced to a
+                // source revision — facts recoverable only from whoever ran
+                // them, for as long as they remember.
+                //
+                // Kept as a SEPARATE file rather than extending config.json:
+                // config.json's shape is depended on by the weight-reloading
+                // path (a bare SimpleCNNConfig, decodable as such), and
+                // widening it would break that for the sake of tidiness.
+                let runConfig = RunConfig(
+                    nodeID: topology.localNode.id,
+                    nodeNumericID: Int(nodeNumericID),
+                    nodeIndex: nodeIndex,
+                    condition: condition,
+                    seed: seed,
+                    rounds: rounds,
+                    learningRate: learningRate,
+                    batchSize: batchSize,
+                    dataDirectory: dataDir.path,
+                    outputDirectory: outputDir.path,
+                    trainSampleCount: trainShard.sampleCount,
+                    testSampleCount: testShard.sampleCount,
+                    trainImageShape: trainShard.imageShape,
+                    topologyPath: arg("--topology", in: args) ?? "topology.json",
+                    topologyMode: topology.mode.rawValue,
+                    peerIDs: topology.peers.map(\.id),
+                    modelConfig: modelConfig
+                )
+                try runConfig.write(to: outputDir)
+                print("[run-round] run config saved to \(outputDir.appendingPathComponent("run_config.json").path)")
+                // Echoed to the terminal as well as written to disk: a wrong
+                // governor or an oversubscribed cpuset is worth seeing at
+                // launch, while the run can still be aborted cheaply, rather
+                // than discovering it in the JSON after 25 rounds.
+                print("[run-round] \(runConfig.summary)")
+                if let gov = runConfig.systemState.governor, gov != "performance" {
+                    print("[run-round] WARNING: CPU governor is '\(gov)', not 'performance'. "
+                          + "Timing and energy figures will carry uncontrolled frequency variation.")
+                }
+                if runConfig.systemState.cpuAffinityCount > 0,
+                   runConfig.systemState.cpuAffinityCount < runConfig.systemState.activeProcessorCount {
+                    print("[run-round] WARNING: process is restricted to "
+                          + "\(runConfig.systemState.cpuAffinityCount) core(s) but Foundation reports "
+                          + "\(runConfig.systemState.activeProcessorCount) — concurrentPerform may "
+                          + "oversubscribe. This node's timings will not represent a genuine "
+                          + "\(runConfig.systemState.cpuAffinityCount)-core device.")
+                }
 
                 try await orchestrator.run(trainShard: trainShard, testShard: testShard, outputDirectory: outputDir)
 
@@ -1192,4 +1262,5 @@ struct RADFLMain {
         return topology
     }
 }
+
 

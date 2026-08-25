@@ -129,6 +129,25 @@ public final class MetricsLogger: @unchecked Sendable {
         "node_id", "condition",
         "bytes_received", "peers_reached", "peers_expected",
         "status",
+        // ── schema v2 ───────────────────────────────────────────────────────
+        // APPENDED, never inserted. metrics.py parses by column name and skips
+        // names it doesn't recognise, so appending is invisible to it; inserting
+        // would shift every position-indexed reader downstream.
+        //
+        // These are written from the first run of the campaign onward, even
+        // though most are the -1 sentinel until their instrumentation lands.
+        // The point is that every CSV produced from here has an IDENTICAL
+        // shape — one schema for the whole campaign instead of analysis code
+        // branching on which columns a given run happened to have.
+        //
+        // -1 in any of these means NOT INSTRUMENTED, not measured-as-zero.
+        // Analysis MUST filter these out rather than averaging over them.
+        "schema_version",
+        "wire_bytes_sent", "wire_bytes_received",
+        "payload_bytes_sent", "payload_bytes_received",
+        "peers_timed_out",
+        "compute_threads",
+        "achieved_freq_khz",
     ].joined(separator: ",")
 
     public init(outputDirectory: URL, condition: String, nodeID: Int, timestamp: String) throws {
@@ -249,8 +268,34 @@ public final class MetricsLogger: @unchecked Sendable {
             String(metrics.nodeID), metrics.condition,
             String(metrics.bytesReceived),
             String(metrics.peersReached), String(metrics.peersExpected),
-            metrics.status.rawValue as String
+            metrics.status.rawValue as String,
+            // schema v2 — order must match csvHeader's tail exactly
+            String(RoundMetrics.schemaVersion),
+            String(metrics.wireBytesSent), String(metrics.wireBytesReceived),
+            String(metrics.payloadBytesSent), String(metrics.payloadBytesReceived),
+            String(metrics.peersTimedOut),
+            String(metrics.computeThreads),
+            String(metrics.achievedFreqKHz),
         ]
+
+        // Column-count guard. The header and this array are two separate
+        // literals that have to stay in lockstep, and a mismatch produces a
+        // silently misaligned CSV rather than an error — every column after the
+        // divergence point shifts, so a numeric column ends up holding a
+        // neighbour's value and still parses as a valid float. That is precisely
+        // the failure this file's own header comment describes hitting before,
+        // via a different route (the torn-file truncation bug). Checking here
+        // costs one comparison per round and turns a silent data-corruption bug
+        // into an immediate, obvious failure at the first logged round.
+        let headerCount = Self.csvHeader.split(separator: ",", omittingEmptySubsequences: false).count
+        precondition(
+            fields.count == headerCount,
+            "MetricsLogger: CSV column count mismatch — header declares \(headerCount) "
+            + "columns but the row has \(fields.count). The csvHeader array and the "
+            + "fields array in log(_:) have diverged; every column after the "
+            + "divergence point would be silently misaligned."
+        )
+
         try write(line: fields.joined(separator: ","), to: csvHandle)
     }
 
@@ -278,4 +323,5 @@ public final class MetricsLogger: @unchecked Sendable {
         jsonlHandle = nil
     }
 }
+
 
