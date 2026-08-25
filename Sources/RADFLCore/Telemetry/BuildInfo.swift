@@ -5,10 +5,10 @@
 public enum BuildInfo {
     /// Short git commit of the source this binary was built from, with a
     /// "-dirty" suffix if the working tree had uncommitted changes.
-    public static let gitCommit = "a1a9610"
+    public static let gitCommit = "99b0079"
 
     /// UTC timestamp of the build, ISO 8601.
-    public static let buildTimestampUTC = "2026-08-25T00:51:41Z"
+    public static let buildTimestampUTC = "2026-08-25T07:28:21Z"
 
     /// SHA-256 of the linked binary — written to build_info.json post-link,
     /// since the binary cannot contain its own hash.

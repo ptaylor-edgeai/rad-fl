@@ -545,8 +545,6 @@ public final class RoundOrchestrator {
             evalLocalS: localEval.evalS,
             gossipPushS: gossipPushS,
             gossipAggS: gossipAggS,
-            gossipWaitS: gossipWaitS,
-            gossipAggregateS: gossipAggregateS,
             roundTotalS: roundTotalS,
             timestamp: roundEndTime,
             effectiveCores: effectiveCores,
@@ -564,7 +562,16 @@ public final class RoundOrchestrator {
             testLoss: testEval.loss,
             localAcc: localEval.accuracy,
             localLoss: localEval.loss,
-            status: .completed
+            status: .completed,
+            // Schema v3 arguments go LAST, matching the order they are
+            // declared in RoundMetrics.init. They were appended there (with
+            // -1 defaults) so that adding them could not break any existing
+            // call site — but that same choice means Swift requires them at
+            // the end of the argument list here, not beside the gossip
+            // parameters they logically belong with. Placing them next to
+            // gossipAggS reads better and does not compile.
+            gossipWaitS: gossipWaitS,
+            gossipAggregateS: gossipAggregateS
         )
     }
 
