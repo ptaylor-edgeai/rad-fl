@@ -148,6 +148,14 @@ public final class MetricsLogger: @unchecked Sendable {
         "peers_timed_out",
         "compute_threads",
         "achieved_freq_khz",
+        // ── schema v3 ───────────────────────────────────────────────────────
+        // gossip_agg_s above is unchanged in value, so v2 and v3 runs remain
+        // comparable on it. These two split what was previously conflated:
+        // gossip_wait_s is the same number under a name that matches what it
+        // measures, and gossip_aggregate_s is the aggregation work that was
+        // never timed at all.
+        "gossip_wait_s",
+        "gossip_aggregate_s",
     ].joined(separator: ",")
 
     public init(outputDirectory: URL, condition: String, nodeID: Int, timestamp: String) throws {
@@ -276,6 +284,9 @@ public final class MetricsLogger: @unchecked Sendable {
             String(metrics.peersTimedOut),
             String(metrics.computeThreads),
             String(metrics.achievedFreqKHz),
+            // schema v3
+            String(metrics.gossipWaitS),
+            String(metrics.gossipAggregateS),
         ]
 
         // Column-count guard. The header and this array are two separate

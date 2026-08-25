@@ -408,9 +408,45 @@ public final class RoundOrchestrator {
         let gossipPushS = Date().timeIntervalSince(gossipStart)  // push-phase-only wall-clock — Python's gossip_push_s
 
         // --- Wait (indefinitely) for every peer's update for THIS round ---
-        let aggStart = Date()
+        //
+        // TIMING NOTE, and a correction to what the previous comment here
+        // claimed. `gossipAggS` was documented as "wait+aggregate wall-clock",
+        // but it is computed on the line immediately after the wait returns,
+        // while the aggregation itself does not run until ~45 lines below
+        // (PeerUpdate construction, tensor-count validation,
+        // GossipAggregator.aggregate, setParameters). So this timer has always
+        // measured the WAIT ALONE, and every second of the aggregation has
+        // been landing outside all logged phases.
+        //
+        // That was not visible until per-round wall-clock was compared against
+        // the sum of the logged phases: they disagreed by ~11s per round on a
+        // 25-round IID run, 13% of the round, larger than the entire gossip
+        // phase as reported. The power trace made the shape of it obvious —
+        // one deep dip per round to ~1.0W, just above the 0.824W platform
+        // floor, exactly at the round boundary.
+        //
+        // Fixed by measuring the two separately, WITHOUT changing what
+        // `gossipAggS` reports. Its value stays exactly as before, so runs
+        // recorded under the old schema remain directly comparable with new
+        // ones. `gossipWaitS` carries the same number under an honest name,
+        // and `gossipAggregateS` adds the measurement that was missing.
+        let waitStart = Date()
         let peerUpdates = try await waitForAllPeerUpdates(round: UInt32(round))
-        let gossipAggS = Date().timeIntervalSince(aggStart)  // wait+aggregate wall-clock only — Python's gossip_agg_s
+        let gossipWaitS = Date().timeIntervalSince(waitStart)
+
+        // Unchanged in value and meaning from every previous run: time from
+        // the end of the push phase until every peer's update has arrived.
+        // Retained rather than redefined so `gossip_agg_s` means the same
+        // thing across the whole campaign. Prefer `gossipWaitS` in new
+        // analysis; this column is kept for continuity, not because it is
+        // well named.
+        let gossipAggS = gossipWaitS
+
+        // Marks the start of the aggregation proper. Everything between here
+        // and `setParameters` is the work that was previously unattributed:
+        // building PeerUpdates from wire messages, validating tensor counts,
+        // the sample-weighted average itself, and adopting the result.
+        let aggregateStart = Date()
 
         // --- Aggregate and adopt the result ---
         // localSampleCount was already defined earlier (before the push),
@@ -457,6 +493,14 @@ public final class RoundOrchestrator {
         let aggregated = GossipAggregator.aggregate(localUpdate: localUpdate, peerUpdates: peerUpdateList)
         model.setParameters(aggregated)
 
+        // Closes the window opened at `aggregateStart`. Deliberately includes
+        // PeerUpdate construction and validation as well as the arithmetic:
+        // those are the cost of turning received wire data into an aggregate,
+        // they scale with peer count exactly as the aggregation does, and
+        // splitting them further would attribute time more precisely than the
+        // question requires.
+        let gossipAggregateS = Date().timeIntervalSince(aggregateStart)
+
         // --- Evaluate both test set and local shard (AFTER aggregation) ---
         // Matches Python's run_experiment.py exactly: both test_metrics and
         // local_metrics are evaluated AFTER gossip.aggregate(), with the
@@ -501,6 +545,8 @@ public final class RoundOrchestrator {
             evalLocalS: localEval.evalS,
             gossipPushS: gossipPushS,
             gossipAggS: gossipAggS,
+            gossipWaitS: gossipWaitS,
+            gossipAggregateS: gossipAggregateS,
             roundTotalS: roundTotalS,
             timestamp: roundEndTime,
             effectiveCores: effectiveCores,
@@ -547,5 +593,6 @@ public final class RoundOrchestrator {
         }
     }
 }
+
 
 

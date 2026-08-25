@@ -41,6 +41,10 @@
 //   v2 — adds schema_version, the wire/payload byte split, peers_timed_out,
 //        compute_threads, achieved_freq_khz. All default to the -1 sentinel
 //        so existing call sites compile and run unchanged.
+//   v3 — adds gossip_wait_s and gossip_aggregate_s. NON-BREAKING:
+//        gossip_agg_s keeps exactly the value it has always had, so v2 runs
+//        stay directly comparable with v3 ones. See those fields for what
+//        the previous instrumentation was actually measuring.
 
 import Foundation
 
@@ -53,7 +57,7 @@ public struct RoundMetrics: Sendable, Codable {
     /// CSV/struct schema version. Bump when columns are added so analysis code
     /// can dispatch on an explicit number rather than sniffing for the presence
     /// of a column and guessing.
-    public static let schemaVersion: Int = 2
+    public static let schemaVersion: Int = 3
 
     public let round: Int
     public let nodeID: Int
@@ -80,7 +84,48 @@ public struct RoundMetrics: Sendable, Codable {
     // boundary mismatch against Python's own metric of the same name.
     public let evalTotalS: Double
     public let gossipPushS: Double         // time spent pushing parameters to peers (outbound only) — Python's gossip_push_s
-    public let gossipAggS: Double          // time spent waiting for peer updates + aggregating them — Python's gossip_agg_s
+
+    /// Python's `gossip_agg_s`, kept bit-for-bit as it has always been
+    /// recorded so that runs from before schema v3 stay directly comparable.
+    ///
+    /// Its documented meaning was "waiting for peer updates + aggregating
+    /// them". That was never what it measured. RoundOrchestrator computed it
+    /// on the line immediately after the peer wait returned, roughly 45 lines
+    /// before the aggregation actually ran, so it has always been WAIT ONLY.
+    ///
+    /// Prefer `gossipWaitS` in new analysis — same number, honest name. This
+    /// field is retained for continuity across the campaign, not because it is
+    /// well named.
+    public let gossipAggS: Double
+
+    /// Time blocked waiting for every peer's update for this round.
+    ///
+    /// Numerically identical to `gossipAggS`; it exists so the quantity has a
+    /// name that matches what it measures. This is straggler-synchronisation
+    /// cost, and it is what topology choice and any deadline-driven local-work
+    /// policy are trying to reduce — so it needs to be addressable by name
+    /// rather than inferred from a mis-named column.
+    ///
+    /// The node is near-idle throughout: measured at ~1.0 W against a 0.824 W
+    /// platform floor, i.e. roughly 0.18 W of recoverable headroom against a
+    /// ~2.5 W loaded draw. Worth knowing before designing any policy that
+    /// proposes to reclaim power during this window — there is far less there
+    /// than the duration suggests.
+    public let gossipWaitS: Double
+
+    /// Time spent turning received peer messages into an adopted model:
+    /// PeerUpdate construction, tensor-count validation, the sample-weighted
+    /// average, and setParameters.
+    ///
+    /// Previously unmeasured, and therefore invisible. It surfaced as part of
+    /// a ~11s per-round gap between round wall-clock and the sum of all logged
+    /// phases — 13% of the round on a 25-node-round IID run, larger than the
+    /// entire gossip phase as it was then reported.
+    ///
+    /// Scales with peer count, so it matters more as topology density rises,
+    /// which is exactly when a topology comparison needs it attributed rather
+    /// than lost.
+    public let gossipAggregateS: Double
     public let roundTotalS: Double        // EXCLUDES evalTotalS — see evalTotalS's doc comment; true total wall-clock is roundTotalS + evalTotalS
 
     // Wall-clock round-end marker — Python's `timestamp` column, written by
@@ -248,7 +293,13 @@ public struct RoundMetrics: Sendable, Codable {
         payloadBytesReceived: Int64 = RoundMetrics.notInstrumented,
         peersTimedOut: Int = -1,
         computeThreads: Int = -1,
-        achievedFreqKHz: Int = -1
+        achievedFreqKHz: Int = -1,
+        // ── schema v3 ───────────────────────────────────────────────────────
+        // Default to -1 (not instrumented) rather than 0, so a build that has
+        // not yet been updated records honestly instead of claiming a measured
+        // zero for a phase it never timed.
+        gossipWaitS: Double = -1,
+        gossipAggregateS: Double = -1
     ) {
         self.round = round
         self.nodeID = nodeID
@@ -287,6 +338,8 @@ public struct RoundMetrics: Sendable, Codable {
         self.peersTimedOut = peersTimedOut
         self.computeThreads = computeThreads
         self.achievedFreqKHz = achievedFreqKHz
+        self.gossipWaitS = gossipWaitS
+        self.gossipAggregateS = gossipAggregateS
     }
 }
 
