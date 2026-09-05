@@ -15,3 +15,4 @@
 # Local-only artifacts / scratch, not part of the source tree.
 swiftly.pkg
 topology_debug.json
+Sources/RADFLCore/Telemetry/BuildInfo.swift
