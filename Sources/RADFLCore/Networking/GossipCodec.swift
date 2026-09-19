@@ -112,12 +112,22 @@ public enum GossipCodec {
                     values.append(v)
                 }
                 buffer.writeInteger(UInt32(indices.count), endianness: .host)
+                // `_ =` on both: writeBytes returns the count written, so the
+                // closure's last expression is an Int rather than Void and the
+                // compiler flags the discarded result. The dense and FP16 paths
+                // above avoid this only because their closures are inferred as
+                // Void — the difference is incidental, not meaningful.
+                //
+                // Worth silencing rather than tolerating: this path is
+                // unreachable today (sparse is rejected at the CLI until delta
+                // mode exists), and a warning parked on dead code is one you
+                // stop noticing before the code becomes live.
                 indices.withUnsafeBufferPointer { ptr in
-                    buffer.writeBytes(UnsafeRawBufferPointer(
+                    _ = buffer.writeBytes(UnsafeRawBufferPointer(
                         start: ptr.baseAddress, count: ptr.count * MemoryLayout<UInt32>.size))
                 }
                 values.withUnsafeBufferPointer { ptr in
-                    buffer.writeBytes(UnsafeRawBufferPointer(
+                    _ = buffer.writeBytes(UnsafeRawBufferPointer(
                         start: ptr.baseAddress, count: ptr.count * MemoryLayout<Float32>.size))
                 }
             }
