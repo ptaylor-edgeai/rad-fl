@@ -176,14 +176,58 @@ public struct RoundOrchestratorConfig: Sendable {
     ///
     /// Ignored entirely when no peer deadline is set, where the first failure
     /// throws as it always did.
-    public let pushRetrySeconds: Double
+    ///
+    /// nil means "use the peer deadline". A SENDER SHOULD KEEP TRYING FOR AS
+    /// LONG AS A RECEIVER IS PREPARED TO WAIT: if this is shorter than the peer
+    /// deadline, a sender can abandon a transfer while the receiver is still
+    /// waiting for it, which guarantees a wasted deadline and desynchronises
+    /// the cluster — a node that has given up moves on and trains while its
+    /// peers wait.
+    ///
+    /// That is not hypothetical. A fixed 15s default was sized for a peer
+    /// briefly unreachable because its event loop is starved mid-training, a
+    /// seconds-scale problem on a LAN. On a 256 kbit link a single push takes
+    /// 3.35s at best and far longer under contention, so senders exhausted the
+    /// budget and moved on while receivers waited the full 240s. Nodes were
+    /// observed receiving round-2 messages from peers whose round-1 update had
+    /// never arrived.
+    ///
+    /// Defaulting to the deadline makes the two move together. An explicit
+    /// value is still accepted for the case where a genuinely shorter retry is
+    /// wanted.
+    public let pushRetrySeconds: Double?
+
+    /// How parameter tensors are encoded for transmission.
+    ///
+    /// Applies ONLY to what goes on the wire. The local node aggregates its own
+    /// uncompressed parameters, so a node sees itself exactly and its peers
+    /// approximately. That asymmetry is inherent to compressed gossip and is
+    /// what the mechanism is being measured for; it is not an implementation
+    /// shortcut.
+    ///
+    /// `.sparseCOO` IS DELIBERATELY NOT ACCEPTED HERE. Sparsification cannot be
+    /// applied to full weights: a receiver fills zeros for untransmitted
+    /// positions, and sample-weighted averaging then halves every parameter
+    /// that was not in the top-k. Simulated on 1000 parameters at 10% density,
+    /// mean aggregate error is 0.0859 against 0.0030 for the same sparsification
+    /// applied to a delta — the model is destroyed rather than degraded.
+    ///
+    /// Sparsification requires delta mode (`weightsDelta`), where untransmitted
+    /// positions fall back to the last agreed state rather than to zero. That is
+    /// a separate piece of work: it needs the receiver to know what state to add
+    /// the delta to, which holds under full mesh (all nodes agree
+    /// post-aggregation to within ~1e-7) but NOT under a sparse topology, where
+    /// cross-node spread has been measured at 0.0163 to 0.0963. Compression and
+    /// topology therefore cannot be combined without revisiting this.
+    public let compression: GossipEncoding
 
     public init(totalRounds: Int, condition: String, baseSeed: UInt64,
                 learningRate: Float, heartbeatIntervalSeconds: Double = 20,
                 peerDeadlineSeconds: Double? = nil,
                 churnDropProbability: Double = 0.0,
                 churnSeed: UInt64 = 0,
-                pushRetrySeconds: Double = 15) {
+                pushRetrySeconds: Double? = nil,
+                compression: GossipEncoding = .dense) {
         self.totalRounds = totalRounds
         self.condition = condition
         self.baseSeed = baseSeed
@@ -193,7 +237,10 @@ public struct RoundOrchestratorConfig: Sendable {
         self.churnDropProbability = churnDropProbability
         self.churnSeed = churnSeed
         self.pushRetrySeconds = pushRetrySeconds
+        self.compression = compression
     }
+
+
 
     /// Deterministic churn decision for one (round, peer) pair.
     ///
@@ -308,6 +355,12 @@ public final class RoundOrchestrator {
         self.peerByNumericID = byID
         self.expectedSenderIDs = Set(byID.keys)
         self.activePeers = topology.peers
+
+        if config.compression != .dense {
+            print("[orchestrator] compression: \(config.compression) "
+                  + "(lossy: \(config.compression.isLossy)) — applied to outbound "
+                  + "tensors only; this node aggregates its own parameters uncompressed")
+        }
     }
 
 
@@ -346,11 +399,13 @@ public final class RoundOrchestrator {
     /// slower device, a longer round — breaks that assumption, and it will
     /// break routinely once heterogeneity profiles deliberately slow nodes down.
     ///
-    /// The retry budget is `pushRetrySeconds` (default 15s), NOT the peer
-    /// deadline. A busy peer becomes reachable as soon as its training phase
-    /// ends, so a short budget covers the real failure mode; spending the full
-    /// deadline here would make a genuinely dead peer cost the deadline twice
-    /// per round — once retrying, then again waiting.
+    /// The retry budget defaults to the peer deadline — see
+    /// `pushRetrySeconds` for why the two must move together. A shorter budget
+    /// can still be set explicitly: it makes a genuinely dead peer cheaper
+    /// (the deadline is not spent twice per round, once retrying and again
+    /// waiting), at the risk of giving up on a peer the receiver is still
+    /// waiting for. On a fast link that trade is worth taking; on a constrained
+    /// one it is not.
     ///
     /// With no deadline configured there is no retry and the first failure
     /// throws, preserving the original fail-loud behaviour exactly.
@@ -358,12 +413,13 @@ public final class RoundOrchestrator {
                                to address: GossipNodeAddress,
                                peerName: String,
                                round: Int) async throws {
-        guard config.peerDeadlineSeconds != nil else {
+        guard let deadline = config.peerDeadlineSeconds else {
             try await client.push(message, to: address)   // fail-loud, no retry
             return
         }
 
-        let giveUpAt = Date().addingTimeInterval(config.pushRetrySeconds)
+        let budget = config.pushRetrySeconds ?? deadline
+        let giveUpAt = Date().addingTimeInterval(budget)
         var attempt = 0
         var backoff: UInt64 = 500_000_000   // 0.5s, doubling to a 5s ceiling
 
@@ -542,7 +598,15 @@ public final class RoundOrchestrator {
             senderNodeID: localNumericID,
             round: UInt32(round),
             sampleCount: UInt32(localSampleCount),
-            tensors: myParameters.enumerated().map { GossipTensor(tensorID: UInt32($0.offset), values: $0.element) }
+            // The compression policy applies HERE and nowhere else. Every
+            // encoding decodes back to a dense array, so nothing downstream —
+            // GossipAggregator, the model, the round loop — is aware a
+            // mechanism is in use. A compressed run and a dense run differ in
+            // exactly one field on the wire.
+            tensors: myParameters.enumerated().map {
+                GossipTensor(tensorID: UInt32($0.offset), values: $0.element,
+                             encoding: config.compression)
+            }
         )
 
         // Byte count computed ONCE per round (not per-peer) — the message
@@ -554,6 +618,37 @@ public final class RoundOrchestrator {
         // reasonable tradeoff rather than threading a byte-count return
         // value through GossipClient.push's public API just for this.
         let messageByteCount = Int64(GossipCodec.encode(outgoingMessage, allocator: ByteBufferAllocator()).readableBytes)
+
+        // What the SAME update would have cost uncompressed. Measured by
+        // encoding it dense rather than computed from the parameter count, so
+        // the two figures include identical framing and per-tensor headers and
+        // their ratio is the realised compression rather than the configured
+        // one.
+        //
+        // Those differ in practice: quantisation leaves the 12-byte per-tensor
+        // header and the 28-byte message header untouched, so a 0.50x payload
+        // is not a 0.50x message. RQ1's frontier is plotted against what was
+        // actually transmitted, and the configured ratio would overstate the
+        // saving.
+        //
+        // Costs one extra encode per round when compressed, on top of the one
+        // already accepted for the byte count itself. At ~105 KB and once per
+        // round against an ~88s round, that is not worth avoiding.
+        let densePayloadByteCount: Int64
+        if config.compression == .dense {
+            densePayloadByteCount = messageByteCount
+        } else {
+            let denseEquivalent = GossipMessage(
+                messageType: outgoingMessage.messageType,
+                senderNodeID: outgoingMessage.senderNodeID,
+                round: outgoingMessage.round,
+                sampleCount: outgoingMessage.sampleCount,
+                tensors: myParameters.enumerated().map {
+                    GossipTensor(tensorID: UInt32($0.offset), values: $0.element)
+                })
+            densePayloadByteCount = Int64(
+                GossipCodec.encode(denseEquivalent, allocator: ByteBufferAllocator()).readableBytes)
+        }
 
         // Closes a previously-flagged gap: peer_push_log.jsonl existed
         // (MetricsLogger creates it on construction) but nothing ever
@@ -839,6 +934,13 @@ public final class RoundOrchestrator {
             // Argument order must match RoundMetrics.init's declaration order:
             // peersTimedOut is a schema-v2 field and therefore precedes the v3
             // gossip timings, while peersChurnDropped is v4 and follows them.
+            // wireBytesSent is what went over the network; payloadBytesSent is
+            // what the dense equivalent would have been. Their ratio is the
+            // realised compression, per round, measured rather than assumed —
+            // which is what an adaptive policy's variable ratio requires, since
+            // its configured value does not describe what happened.
+            wireBytesSent: messageByteCount * Int64(activePeers.count),
+            payloadBytesSent: densePayloadByteCount * Int64(activePeers.count),
             peersTimedOut: waitOutcome.timedOut.count,
             gossipWaitS: gossipWaitS,
             gossipAggregateS: gossipAggregateS,

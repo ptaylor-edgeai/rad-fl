@@ -8,6 +8,13 @@
 // pure overhead with zero portability benefit for this deployment. If the
 // cluster ever becomes heterogeneous-architecture, this is the place to add
 // explicit little-endian framing.
+//
+// COMPRESSION LIVES HERE AND NOWHERE ELSE. Every encoding decodes back to a
+// dense `[Float32]`, so `GossipAggregator`, `SimpleCNN` and the round loop are
+// untouched by RQ1's mechanisms and require no change when one is added. A
+// compressed run and a dense run differ in exactly one field on the wire, which
+// is what makes the comparison attributable to the mechanism rather than to
+// anything else that moved with it.
 
 import Foundation
 import NIOCore
@@ -18,6 +25,7 @@ public enum GossipCodecError: Error, CustomStringConvertible {
     case unknownMessageType(raw: UInt32)
     case unknownEncoding(raw: UInt32)
     case truncatedFrame(expectedAtLeast: Int, got: Int)
+    case malformedSparse(nonzeroCount: Int, denseCount: Int)
 
     public var description: String {
         switch self {
@@ -28,9 +36,15 @@ public enum GossipCodecError: Error, CustomStringConvertible {
         case .unknownMessageType(let raw):
             return "GossipCodec: unknown message type \(raw)"
         case .unknownEncoding(let raw):
-            return "GossipCodec: unknown tensor encoding \(raw)"
+            return "GossipCodec: unknown tensor encoding \(raw) — a peer is sending "
+                 + "a compression mechanism this binary does not implement. Check that "
+                 + "every node is running the same build."
         case .truncatedFrame(let expected, let got):
             return "GossipCodec: truncated frame, expected at least \(expected) bytes, buffer has \(got)"
+        case .malformedSparse(let nnz, let dense):
+            return "GossipCodec: sparse tensor claims \(nnz) nonzeros in a \(dense)-element "
+                 + "tensor — more nonzeros than elements is impossible, so the frame is corrupt "
+                 + "or the sender's encoder is wrong"
         }
     }
 }
@@ -56,14 +70,56 @@ public enum GossipCodec {
         for tensor in message.tensors {
             buffer.writeInteger(tensor.tensorID, endianness: .host)
             buffer.writeInteger(tensor.encoding.rawValue, endianness: .host)
+            // ALWAYS the dense element count, for every encoding — the receiver
+            // needs it to size the reconstructed array. Sparse carries its own
+            // nonzero count in the payload.
             buffer.writeInteger(UInt32(tensor.values.count), endianness: .host)
 
-            // Dense payload: flat Float32 array, written via withUnsafeBufferPointer
-            // to avoid a per-element function-call write — matters at model scale
-            // (hundreds of thousands of params) on a CPU this constrained.
-            tensor.values.withUnsafeBufferPointer { ptr in
-                let byteCount = ptr.count * MemoryLayout<Float32>.size
-                buffer.writeBytes(UnsafeRawBufferPointer(start: ptr.baseAddress, count: byteCount))
+            switch tensor.encoding {
+            case .dense:
+                // Flat Float32, written via withUnsafeBufferPointer to avoid a
+                // per-element function-call write — matters at model scale
+                // (hundreds of thousands of params) on a CPU this constrained.
+                tensor.values.withUnsafeBufferPointer { ptr in
+                    let byteCount = ptr.count * MemoryLayout<Float32>.size
+                    buffer.writeBytes(UnsafeRawBufferPointer(start: ptr.baseAddress, count: byteCount))
+                }
+
+            case .denseFP16:
+                let bits = TensorCodec.toFP16(tensor.values)
+                bits.withUnsafeBufferPointer { ptr in
+                    let byteCount = ptr.count * MemoryLayout<UInt16>.size
+                    buffer.writeBytes(UnsafeRawBufferPointer(start: ptr.baseAddress, count: byteCount))
+                }
+
+            case .denseINT8:
+                let (quantised, scale) = TensorCodec.toINT8(tensor.values)
+                // Scale and offset precede the payload so the decoder can read
+                // them without knowing the element count first.
+                buffer.writeInteger(scale.min.bitPattern, endianness: .host)
+                buffer.writeInteger(scale.scale.bitPattern, endianness: .host)
+                buffer.writeBytes(quantised)
+
+            case .sparseCOO:
+                // Indices are derived from the nonzeros of the dense array. The
+                // caller has already zeroed whatever it chose to drop — see
+                // GossipTensor's doc comment for why the in-memory shape stays
+                // dense regardless of encoding.
+                var indices: [UInt32] = []
+                var values: [Float32] = []
+                for (i, v) in tensor.values.enumerated() where v != 0 {
+                    indices.append(UInt32(i))
+                    values.append(v)
+                }
+                buffer.writeInteger(UInt32(indices.count), endianness: .host)
+                indices.withUnsafeBufferPointer { ptr in
+                    buffer.writeBytes(UnsafeRawBufferPointer(
+                        start: ptr.baseAddress, count: ptr.count * MemoryLayout<UInt32>.size))
+                }
+                values.withUnsafeBufferPointer { ptr in
+                    buffer.writeBytes(UnsafeRawBufferPointer(
+                        start: ptr.baseAddress, count: ptr.count * MemoryLayout<Float32>.size))
+                }
             }
         }
 
@@ -73,6 +129,11 @@ public enum GossipCodec {
     private static func estimatedSize(of message: GossipMessage) -> Int {
         let headerSize = 7 * MemoryLayout<UInt32>.size  // magic, version, messageType, senderNodeID, round, sampleCount, tensor count
         let tensorOverhead = message.tensors.count * (3 * MemoryLayout<UInt32>.size)
+        // Sized for the dense case regardless of encoding: every other encoding
+        // is smaller, so this over-allocates rather than forcing a reallocation
+        // mid-write. Sparse is the exception — above 50% density it exceeds
+        // dense — but a mechanism sending sparse at that density has chosen
+        // wrongly, and a reallocation is the least of that problem.
         let payloadSize = message.tensors.reduce(0) { $0 + $1.values.count * MemoryLayout<Float32>.size }
         return headerSize + tensorOverhead + payloadSize
     }
@@ -82,14 +143,15 @@ public enum GossipCodec {
     /// Decodes a complete application frame from `buffer`. Assumes the outer
     /// length-prefix has already been stripped by the NIO decoder and that
     /// `buffer` contains exactly one full message.
+    ///
+    /// Every encoding reconstructs to a dense `[Float32]`, so callers never see
+    /// a compressed tensor.
     public static func decode(_ buffer: inout ByteBuffer) throws -> GossipMessage {
-        // 7 fields now, not 6: magic, version, messageType, senderNodeID,
-        // round, sampleCount, tensorCount — sampleCount is a new field
-        // (see GossipMessage.swift's doc comment for why), and this
-        // headerSize constant is the MINIMUM-bytes-required check used by
-        // every truncation guard below, not just the first one — getting
-        // it wrong here would make every one of those guards check against
-        // a stale, too-small minimum.
+        // 7 fields: magic, version, messageType, senderNodeID, round,
+        // sampleCount, tensorCount. This headerSize constant is the
+        // MINIMUM-bytes-required check used by every truncation guard below,
+        // not just the first one — getting it wrong here would make every one
+        // of those guards check against a stale, too-small minimum.
         let headerSize = 7 * MemoryLayout<UInt32>.size
         guard buffer.readableBytes >= headerSize else {
             throw GossipCodecError.truncatedFrame(expectedAtLeast: headerSize, got: buffer.readableBytes)
@@ -132,26 +194,84 @@ public enum GossipCodec {
         for _ in 0..<tensorCount {
             guard let tensorID: UInt32 = buffer.readInteger(endianness: .host),
                   let rawEncoding: UInt32 = buffer.readInteger(endianness: .host),
-                  let encoding = GossipEncoding(rawValue: rawEncoding),
                   let elementCount: UInt32 = buffer.readInteger(endianness: .host) else {
                 throw GossipCodecError.truncatedFrame(expectedAtLeast: 12, got: buffer.readableBytes)
             }
+            guard let encoding = GossipEncoding(rawValue: rawEncoding) else {
+                throw GossipCodecError.unknownEncoding(raw: rawEncoding)
+            }
+
+            let dense = Int(elementCount)
+            let values: [Float32]
 
             switch encoding {
             case .dense:
-                let byteCount = Int(elementCount) * MemoryLayout<Float32>.size
+                let byteCount = dense * MemoryLayout<Float32>.size
                 guard buffer.readableBytes >= byteCount else {
                     throw GossipCodecError.truncatedFrame(expectedAtLeast: byteCount, got: buffer.readableBytes)
                 }
-                let values: [Float32] = buffer.readBytes(length: byteCount)!.withUnsafeBytes { raw in
+                values = buffer.readBytes(length: byteCount)!.withUnsafeBytes { raw in
                     Array(raw.bindMemory(to: Float32.self))
                 }
-                tensors.append(GossipTensor(tensorID: tensorID, values: values))
+
+            case .denseFP16:
+                let byteCount = dense * MemoryLayout<UInt16>.size
+                guard buffer.readableBytes >= byteCount else {
+                    throw GossipCodecError.truncatedFrame(expectedAtLeast: byteCount, got: buffer.readableBytes)
+                }
+                let bits: [UInt16] = buffer.readBytes(length: byteCount)!.withUnsafeBytes { raw in
+                    Array(raw.bindMemory(to: UInt16.self))
+                }
+                values = TensorCodec.fromFP16(bits)
+
+            case .denseINT8:
+                let metaBytes = 2 * MemoryLayout<Float32>.size
+                guard buffer.readableBytes >= metaBytes + dense else {
+                    throw GossipCodecError.truncatedFrame(
+                        expectedAtLeast: metaBytes + dense, got: buffer.readableBytes)
+                }
+                guard let minBits: UInt32 = buffer.readInteger(endianness: .host),
+                      let scaleBits: UInt32 = buffer.readInteger(endianness: .host),
+                      let quantised = buffer.readBytes(length: dense) else {
+                    throw GossipCodecError.truncatedFrame(
+                        expectedAtLeast: metaBytes + dense, got: buffer.readableBytes)
+                }
+                let scale = TensorCodec.AffineScale(min: Float32(bitPattern: minBits),
+                                                    scale: Float32(bitPattern: scaleBits))
+                values = TensorCodec.fromINT8(quantised, scale)
 
             case .sparseCOO:
-                // Reserved for future work — not yet implemented on the wire.
-                throw GossipCodecError.unknownEncoding(raw: rawEncoding)
+                guard let nnz32: UInt32 = buffer.readInteger(endianness: .host) else {
+                    throw GossipCodecError.truncatedFrame(
+                        expectedAtLeast: MemoryLayout<UInt32>.size, got: buffer.readableBytes)
+                }
+                let nnz = Int(nnz32)
+                // Checked before allocating: a corrupt nnz larger than the dense
+                // count would otherwise size an array from an untrusted field.
+                guard nnz <= dense else {
+                    throw GossipCodecError.malformedSparse(nonzeroCount: nnz, denseCount: dense)
+                }
+                let idxBytes = nnz * MemoryLayout<UInt32>.size
+                let valBytes = nnz * MemoryLayout<Float32>.size
+                guard buffer.readableBytes >= idxBytes + valBytes else {
+                    throw GossipCodecError.truncatedFrame(
+                        expectedAtLeast: idxBytes + valBytes, got: buffer.readableBytes)
+                }
+                let indices: [UInt32] = buffer.readBytes(length: idxBytes)!.withUnsafeBytes { raw in
+                    Array(raw.bindMemory(to: UInt32.self))
+                }
+                let sparseValues: [Float32] = buffer.readBytes(length: valBytes)!.withUnsafeBytes { raw in
+                    Array(raw.bindMemory(to: Float32.self))
+                }
+                values = TensorCodec.fromSparse(TensorCodec.Sparse(
+                    denseCount: dense, indices: indices, values: sparseValues))
             }
+
+            // Reconstructed tensors are always dense in memory. The encoding is
+            // carried through so a receiver can report what it was sent — the
+            // payload-byte accounting RQ1 needs cannot be recovered from the
+            // dense array alone.
+            tensors.append(GossipTensor(tensorID: tensorID, values: values, encoding: encoding))
         }
 
         return GossipMessage(messageType: messageType, senderNodeID: senderNodeID, round: round, sampleCount: sampleCount, tensors: tensors)

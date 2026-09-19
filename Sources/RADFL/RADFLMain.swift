@@ -139,6 +139,7 @@ struct RADFLMain {
                             compiler — this is the first real check of its correctness,
                             the same way test-cnn was for Tensor.swift's other primitives.)
                            [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--batch-size <n>] [--output-dir <path>]
+                           [--compression none|fp16|int8]
                            [--peer-deadline-s <f>] [--startup-deadline-s <f>] [--push-retry-s <f>]
                            [--churn-drop <p>] [--churn-seed <n>]
                            (runs the FULL federated learning loop for real, on real
@@ -182,17 +183,29 @@ struct RADFLMain {
                             sentinel means NOT INSTRUMENTED, explicitly distinct from a
                             measured zero; see RoundMetrics.swift. Defaults: 5 rounds,
                             learning rate 0.01, batch size 32, seed 42.
+                            COMPRESSION: --compression selects how parameter tensors are
+                            encoded for transmission. fp16 halves the payload at ~2e-04 max
+                            error; int8 quarters it at ~4e-03. Both are lossy and apply to
+                            OUTBOUND tensors only — a node aggregates its own parameters
+                            uncompressed, so it sees itself exactly and its peers
+                            approximately. wire_bytes_sent and payload_bytes_sent record
+                            what was transmitted and what the dense equivalent would have
+                            been; their ratio is the realised compression, which is smaller
+                            than the configured one because message and per-tensor headers
+                            are not compressed.
                             FAILURE REGIMES: there are TWO waits and they need separate
                             deadlines. --startup-deadline-s bounds the wait before round 1
                             for every peer to become reachable; peers still down when it
                             expires are EXCLUDED from the run entirely (not pushed to, not
                             waited for) and named in run_config.json, since a node that
                             never joined is a permanent absence rather than a per-round
-                            timeout. --push-retry-s (default 15) bounds how
-                            long a failed push is retried: a peer mid-training cannot
-                            accept connections, because concurrentPerform starves the NIO
-                            event loop, so a refused connection means BUSY rather than
-                            DEAD. Pushes run concurrently with the wait, so a round's
+                            timeout. --push-retry-s bounds how long a failed
+                            push is retried, and DEFAULTS TO THE PEER DEADLINE: a sender
+                            should keep trying for as long as a receiver is prepared to
+                            wait, or it can abandon a transfer the receiver is still
+                            waiting for. A peer mid-training cannot accept connections,
+                            because concurrentPerform starves the NIO event loop, so a
+                            refused connection means BUSY rather than DEAD. Pushes run concurrently with the wait, so a round's
                             gossip cost is max(push, wait) rather than their sum — note
                             that gossip_push_s and gossip_wait_s therefore overlap and must
                             not be added together. --peer-deadline-s bounds the wait for peer
@@ -549,7 +562,36 @@ struct RADFLMain {
                 let peerDeadline = arg("--peer-deadline-s", in: args).flatMap { Double($0) }
                 let churnDrop = Double(arg("--churn-drop", in: args) ?? "0") ?? 0
                 let churnSeed = UInt64(arg("--churn-seed", in: args) ?? "0") ?? 0
-                let pushRetry = Double(arg("--push-retry-s", in: args) ?? "15") ?? 15
+                // nil means "use the peer deadline" — see
+                // RoundOrchestratorConfig.pushRetrySeconds. Explicitly omitting
+                // this flag is now the right default rather than a value to be
+                // supplied alongside every deadline.
+                let pushRetry = arg("--push-retry-s", in: args).flatMap { Double($0) }
+
+                // Compression mechanism. Rejected rather than defaulted on an
+                // unknown value: silently falling back to dense would produce a
+                // run labelled as compressed that was not, and the results
+                // would be indistinguishable from a correct dense baseline.
+                let compressionArg = (arg("--compression", in: args) ?? "none").lowercased()
+                let compression: GossipEncoding
+                switch compressionArg {
+                case "none", "dense": compression = .dense
+                case "fp16":          compression = .denseFP16
+                case "int8":          compression = .denseINT8
+                case "topk":
+                    FileHandle.standardError.write(Data(
+                        ("error: --compression topk is not implemented.\n"
+                         + "  Sparsification cannot be applied to full weights: a receiver\n"
+                         + "  fills zeros for untransmitted positions, and sample-weighted\n"
+                         + "  averaging then halves every parameter outside the top-k.\n"
+                         + "  It requires delta mode, where untransmitted positions fall back\n"
+                         + "  to the last agreed state. Not yet built.\n").utf8))
+                    exit(2)
+                default:
+                    FileHandle.standardError.write(Data(
+                        "error: unknown --compression '\(compressionArg)' — expected none|fp16|int8\n".utf8))
+                    exit(2)
+                }
 
                 // Startup readiness deadline, distinct from the per-round peer
                 // deadline. There are TWO waits in a run and they fail
@@ -655,7 +697,8 @@ struct RADFLMain {
                     peerDeadlineSeconds: peerDeadline,
                     churnDropProbability: churnDrop,
                     churnSeed: churnSeed,
-                    pushRetrySeconds: pushRetry
+                    pushRetrySeconds: pushRetry,
+                    compression: compression
                 )
                 if let peerDeadline {
                     print("[run-round] peer deadline \(peerDeadline)s — rounds will "
@@ -847,6 +890,7 @@ struct RADFLMain {
                     peerDeadlineSeconds: peerDeadline,
                     churnDropProbability: churnDrop,
                     churnSeed: churnSeed,
+                    compression: compressionArg,
                     dataDirectory: dataDir.path,
                     outputDirectory: outputDir.path,
                     trainSampleCount: trainShard.sampleCount,

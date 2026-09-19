@@ -225,6 +225,14 @@ public struct RunConfig: Codable {
     public let churnDropProbability: Double
     public let churnSeed: UInt64
 
+    /// Compression mechanism, as configured. Declared rather than measured —
+    /// unlike link shaping, this is genuinely under the binary's control, so
+    /// what it was told to do is what it did. The realised byte ratio is in
+    /// training_log.csv (wire_bytes_sent / payload_bytes_sent), which is the
+    /// number to report: it is smaller than the configured ratio, because
+    /// message and per-tensor headers are not compressed.
+    public let compression: String
+
     // Data
     public let dataDirectory: String
     public let outputDirectory: String
@@ -283,6 +291,7 @@ public struct RunConfig: Codable {
         peerDeadlineSeconds: Double? = nil,
         churnDropProbability: Double = 0,
         churnSeed: UInt64 = 0,
+        compression: String = "none",
         dataDirectory: String,
         outputDirectory: String,
         trainSampleCount: Int,
@@ -314,6 +323,7 @@ public struct RunConfig: Codable {
         self.peerDeadlineSeconds = peerDeadlineSeconds
         self.churnDropProbability = churnDropProbability
         self.churnSeed = churnSeed
+        self.compression = compression
 
         self.dataDirectory = dataDirectory
         self.outputDirectory = outputDirectory
@@ -358,11 +368,12 @@ public struct RunConfig: Codable {
         let freq = systemState.scalingCurFreqKHz.map { "\($0 / 1000)MHz" } ?? "n/a"
         let cores = "\(systemState.cpuAffinityCount)/\(systemState.cpuOnlineCount)"
         let regime = peerDeadlineSeconds.map { "deadline=\($0)s" } ?? "no-deadline"
+        let comp = compression == "none" ? "" : " compression=\(compression)"
         let excl = excludedPeerIDs.isEmpty ? ""
                  : " excluded=\(excludedPeerIDs.joined(separator: ","))"
         let churn = churnDropProbability > 0 ? " churn=\(churnDropProbability)" : ""
         return "seed=\(seed) rounds=\(rounds) lr=\(learningRate) batch=\(batchSize) "
-            + "| \(regime)\(churn)\(excl) "
+            + "| \(regime)\(churn)\(comp)\(excl) "
             + "| \(condition.raw) n=\(trainSampleCount) "
             + "| \(topologyMode) peers=\(peersExpected) "
             + "| gov=\(gov) freq=\(freq) cores=\(cores) "
