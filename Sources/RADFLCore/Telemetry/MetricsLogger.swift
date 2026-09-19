@@ -156,6 +156,8 @@ public final class MetricsLogger: @unchecked Sendable {
         // never timed at all.
         "gossip_wait_s",
         "gossip_aggregate_s",
+        // ── schema v4 ───────────────────────────────────────────────────────
+        "peers_churn_dropped",
     ].joined(separator: ",")
 
     public init(outputDirectory: URL, condition: String, nodeID: Int, timestamp: String) throws {
@@ -287,6 +289,8 @@ public final class MetricsLogger: @unchecked Sendable {
             // schema v3
             String(metrics.gossipWaitS),
             String(metrics.gossipAggregateS),
+            // schema v4
+            String(metrics.peersChurnDropped),
         ]
 
         // Column-count guard. The header and this array are two separate

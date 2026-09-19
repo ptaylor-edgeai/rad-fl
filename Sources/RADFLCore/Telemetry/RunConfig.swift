@@ -216,6 +216,15 @@ public struct RunConfig: Codable {
     public let learningRate: Float
     public let batchSize: Int
 
+    // Failure regime. nil / 0 means the default: wait indefinitely for peers,
+    // drop nothing. Recorded because a run that tolerated peer loss and one
+    // that did not are different experiments, and the difference is invisible
+    // in the results otherwise — a clean run under a deadline looks identical
+    // to a clean run without one.
+    public let peerDeadlineSeconds: Double?
+    public let churnDropProbability: Double
+    public let churnSeed: UInt64
+
     // Data
     public let dataDirectory: String
     public let outputDirectory: String
@@ -228,6 +237,16 @@ public struct RunConfig: Codable {
     public let topologyMode: String
     public let peersExpected: Int
     public let peerIDs: [String]
+
+    /// Peers that were unreachable when the run started and were excluded from
+    /// it, per --startup-deadline-s.
+    ///
+    /// Recorded because the graph a run actually used is not the graph in the
+    /// topology file it was handed. Without this, a ten-node run that silently
+    /// proceeded on nine would be indistinguishable from a healthy one, and
+    /// per-node degree derived from the topology file would be wrong for every
+    /// neighbour of the missing node.
+    public let excludedPeerIDs: [String]
 
     // Model architecture (same content as config.json, embedded here too so
     // this file alone is sufficient to describe the run — config.json stays
@@ -261,6 +280,9 @@ public struct RunConfig: Codable {
         rounds: Int,
         learningRate: Float,
         batchSize: Int,
+        peerDeadlineSeconds: Double? = nil,
+        churnDropProbability: Double = 0,
+        churnSeed: UInt64 = 0,
         dataDirectory: String,
         outputDirectory: String,
         trainSampleCount: Int,
@@ -269,6 +291,7 @@ public struct RunConfig: Codable {
         topologyPath: String,
         topologyMode: String,
         peerIDs: [String],
+        excludedPeerIDs: [String] = [],
         modelConfig: SimpleCNNConfig,
         computeThreads: Int = -1
     ) {
@@ -288,6 +311,9 @@ public struct RunConfig: Codable {
         self.rounds = rounds
         self.learningRate = learningRate
         self.batchSize = batchSize
+        self.peerDeadlineSeconds = peerDeadlineSeconds
+        self.churnDropProbability = churnDropProbability
+        self.churnSeed = churnSeed
 
         self.dataDirectory = dataDirectory
         self.outputDirectory = outputDirectory
@@ -297,8 +323,10 @@ public struct RunConfig: Codable {
 
         self.topologyPath = topologyPath
         self.topologyMode = topologyMode
-        self.peersExpected = peerIDs.count
-        self.peerIDs = peerIDs
+        self.excludedPeerIDs = excludedPeerIDs.sorted()
+        let active = peerIDs.filter { !excludedPeerIDs.contains($0) }
+        self.peersExpected = active.count
+        self.peerIDs = active
 
         self.modelConfig = modelConfig
 
@@ -329,10 +357,16 @@ public struct RunConfig: Codable {
         let gov = systemState.governor ?? "n/a"
         let freq = systemState.scalingCurFreqKHz.map { "\($0 / 1000)MHz" } ?? "n/a"
         let cores = "\(systemState.cpuAffinityCount)/\(systemState.cpuOnlineCount)"
+        let regime = peerDeadlineSeconds.map { "deadline=\($0)s" } ?? "no-deadline"
+        let excl = excludedPeerIDs.isEmpty ? ""
+                 : " excluded=\(excludedPeerIDs.joined(separator: ","))"
+        let churn = churnDropProbability > 0 ? " churn=\(churnDropProbability)" : ""
         return "seed=\(seed) rounds=\(rounds) lr=\(learningRate) batch=\(batchSize) "
+            + "| \(regime)\(churn)\(excl) "
             + "| \(condition.raw) n=\(trainSampleCount) "
             + "| \(topologyMode) peers=\(peersExpected) "
             + "| gov=\(gov) freq=\(freq) cores=\(cores) "
             + "| commit=\(gitCommit)"
     }
 }
+

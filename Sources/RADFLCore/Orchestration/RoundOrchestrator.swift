@@ -128,12 +128,90 @@ public struct RoundOrchestratorConfig: Sendable {
     public let learningRate: Float
     public let heartbeatIntervalSeconds: Double   // how often to print "still waiting on..." while blocked
 
-    public init(totalRounds: Int, condition: String, baseSeed: UInt64, learningRate: Float, heartbeatIntervalSeconds: Double = 20) {
+    /// Seconds to wait for peer updates before proceeding without them.
+    /// `nil` (the default) preserves the original indefinite wait exactly.
+    ///
+    /// The indefinite wait was the right call for development — a stalled
+    /// round should be visible and investigated, not silently completed with a
+    /// subset of peers. It also makes every failure regime unmeasurable: a
+    /// crashed peer blocks its neighbours forever, so no experiment involving
+    /// node loss, churn or partition can run at all.
+    ///
+    /// Opt-in rather than a new default so that every run recorded so far
+    /// remains reproducible with the same binary, and so a deadline can never
+    /// mask a genuine stall in a run that did not intend to tolerate one.
+    ///
+    /// FIXED seconds, not a multiple of the node's own round time. A relative
+    /// deadline would adapt to heterogeneous hardware — which will matter once
+    /// cgroup profiles are in play, since a deliberately slowed node under a
+    /// fixed deadline is permanently late through no fault of the topology.
+    /// Recorded here as the known next step rather than built speculatively.
+    public let peerDeadlineSeconds: Double?
+
+    /// Per-peer, per-round probability that this node ignores a peer's update
+    /// even though it arrived — synthetic churn for the failure regimes.
+    ///
+    /// Injected at the RECEIVING node rather than by silencing a sender, so
+    /// churn is per-link rather than per-node: a peer can be dropped by one
+    /// neighbour and heard by another, which is what intermittent connectivity
+    /// actually looks like. Node-level failure is a separate mechanism.
+    public let churnDropProbability: Double
+
+    /// Seed for the churn RNG, kept separate from `baseSeed`.
+    ///
+    /// Separate because the churn realisation is itself a random variable worth
+    /// sampling independently: three churn draws at ONE partition seed isolates
+    /// failure-pattern variance from partition variance, and mixing the two
+    /// into one seed would make that impossible.
+    public let churnSeed: UInt64
+
+    /// How long to keep retrying a failed push before giving up, in seconds.
+    ///
+    /// Defaults to 15s rather than the full peer deadline. The failure it
+    /// exists for — a peer whose event loop is starved because it is mid-
+    /// training — resolves the moment that peer's training phase ends, and in
+    /// practice within a few seconds of a normal round boundary. Spending the
+    /// entire peer deadline on it means a genuinely dead peer costs the
+    /// deadline TWICE per round, once retrying and again waiting.
+    ///
+    /// Ignored entirely when no peer deadline is set, where the first failure
+    /// throws as it always did.
+    public let pushRetrySeconds: Double
+
+    public init(totalRounds: Int, condition: String, baseSeed: UInt64,
+                learningRate: Float, heartbeatIntervalSeconds: Double = 20,
+                peerDeadlineSeconds: Double? = nil,
+                churnDropProbability: Double = 0.0,
+                churnSeed: UInt64 = 0,
+                pushRetrySeconds: Double = 15) {
         self.totalRounds = totalRounds
         self.condition = condition
         self.baseSeed = baseSeed
         self.learningRate = learningRate
         self.heartbeatIntervalSeconds = heartbeatIntervalSeconds
+        self.peerDeadlineSeconds = peerDeadlineSeconds
+        self.churnDropProbability = churnDropProbability
+        self.churnSeed = churnSeed
+        self.pushRetrySeconds = pushRetrySeconds
+    }
+
+    /// Deterministic churn decision for one (round, peer) pair.
+    ///
+    /// Derived from (churnSeed, round, peer) rather than drawn from a running
+    /// RNG, so the decision does not depend on how many other draws happened
+    /// first. That matters because peer updates arrive in nondeterministic
+    /// order: a sequential RNG would give a different drop pattern on every
+    /// run of the same configuration, making failure regimes irreproducible in
+    /// exactly the way seeds exist to prevent.
+    func shouldDropPeer(round: Int, peerID: UInt32) -> Bool {
+        guard churnDropProbability > 0 else { return false }
+        var rng = SplitMix64(seed: churnSeed
+                             &+ (UInt64(round) &* 0x9E37_79B9_7F4A_7C15)
+                             &+ (UInt64(peerID) &* 0xBF58_476D_1CE4_E5B9))
+        _ = rng.next()   // discard the first output; SplitMix64's first value
+                         // correlates visibly with similar seeds
+        return Double(rng.next() >> 11) * (1.0 / 9007199254740992.0)
+               < churnDropProbability
     }
 
     /// Derives a per-round shuffle seed from the base seed and round
@@ -181,8 +259,17 @@ public final class RoundOrchestrator {
     private let collector: InboundUpdateCollector
     private let metricsLogger: MetricsLogger
     private let localNumericID: UInt32
-    private let peerByNumericID: [UInt32: TopologyNode]
-    private let expectedSenderIDs: Set<UInt32>
+    private var peerByNumericID: [UInt32: TopologyNode]
+    // `var`, not `let`, because exclusion is decided AFTER construction. The
+    // orchestrator has to exist before the startup readiness gate runs — it is
+    // what handles inbound messages while this node waits — so which peers
+    // never showed up is not knowable at init time.
+    private var expectedSenderIDs: Set<UInt32>
+    /// Peers this node will actually push to — topology.peers minus any
+    /// excluded at startup. Used instead of `topology.peers` everywhere a
+    /// round iterates peers, so an excluded node is neither pushed to nor
+    /// waited for.
+    private var activePeers: [TopologyNode]
     private let onTrainingProgress: (@Sendable (_ round: Int, _ batchIndex: Int, _ totalBatches: Int) -> Void)?
 
     public init(
@@ -208,6 +295,10 @@ public final class RoundOrchestrator {
             throw RoundOrchestratorError.localNodeIDNotNumeric(error)
         }
 
+        // Starts with every peer in the topology. Peers that never come up are
+        // removed later by `excludePeers`, once the startup readiness gate has
+        // determined which those are — see that method for why exclusion
+        // cannot happen here.
         var byID: [UInt32: TopologyNode] = [:]
         for peer in topology.peers {
             if let id = try? peer.numericID() {
@@ -216,6 +307,112 @@ public final class RoundOrchestrator {
         }
         self.peerByNumericID = byID
         self.expectedSenderIDs = Set(byID.keys)
+        self.activePeers = topology.peers
+    }
+
+
+    /// Writes one peer_push_log.jsonl line per lost peer, naming it.
+    ///
+    /// Best-effort: a logging failure must not abort a round that otherwise
+    /// succeeded, and the counts in training_log.csv remain authoritative for
+    /// how many were lost. These entries add the identities.
+    private func logPeerLosses(round: Int, outcome: PeerWaitOutcome, waitedS: Double) {
+        for peerID in outcome.timedOut {
+            guard let node = peerByNumericID[peerID] else { continue }
+            try? metricsLogger.log(.timeout(
+                round: round, fromNode: Int(localNumericID), toNode: Int(peerID),
+                peerID: node.id, waitedS: waitedS))
+        }
+        for peerID in outcome.churnDropped {
+            guard let node = peerByNumericID[peerID] else { continue }
+            try? metricsLogger.log(.churnDropped(
+                round: round, fromNode: Int(localNumericID), toNode: Int(peerID),
+                peerID: node.id))
+        }
+    }
+
+    /// Pushes to one peer, retrying with backoff until the peer deadline.
+    ///
+    /// A refused connection means the peer is BUSY, not dead. Training
+    /// saturates all cores via `concurrentPerform`, which starves the NIO
+    /// event loop, so a node in the middle of its training phase cannot accept
+    /// connections. Observed directly: a node received weights FROM a peer in
+    /// the same round that it failed to push TO that peer, and a late-starting
+    /// node failed to push to seven peers while all ten were healthy.
+    ///
+    /// This never surfaced before the failure regimes because nodes normally
+    /// finish training within a second or two of each other, so everyone
+    /// pushes while nobody is training. Any skew — a node that started late, a
+    /// slower device, a longer round — breaks that assumption, and it will
+    /// break routinely once heterogeneity profiles deliberately slow nodes down.
+    ///
+    /// The retry budget is `pushRetrySeconds` (default 15s), NOT the peer
+    /// deadline. A busy peer becomes reachable as soon as its training phase
+    /// ends, so a short budget covers the real failure mode; spending the full
+    /// deadline here would make a genuinely dead peer cost the deadline twice
+    /// per round — once retrying, then again waiting.
+    ///
+    /// With no deadline configured there is no retry and the first failure
+    /// throws, preserving the original fail-loud behaviour exactly.
+    private func pushWithRetry(_ message: GossipMessage,
+                               to address: GossipNodeAddress,
+                               peerName: String,
+                               round: Int) async throws {
+        guard config.peerDeadlineSeconds != nil else {
+            try await client.push(message, to: address)   // fail-loud, no retry
+            return
+        }
+
+        let giveUpAt = Date().addingTimeInterval(config.pushRetrySeconds)
+        var attempt = 0
+        var backoff: UInt64 = 500_000_000   // 0.5s, doubling to a 5s ceiling
+
+        while true {
+            do {
+                try await client.push(message, to: address)
+                if attempt > 0 {
+                    print("[round \(round)] push to \(peerName) succeeded on attempt "
+                          + "\(attempt + 1) — peer was busy, not down")
+                }
+                return
+            } catch {
+                attempt += 1
+                if Date() >= giveUpAt {
+                    throw error
+                }
+                try await Task.sleep(nanoseconds: backoff)
+                backoff = min(backoff * 2, 5_000_000_000)
+            }
+        }
+    }
+
+    /// Removes peers that never became reachable from this run.
+    ///
+    /// Called after the startup readiness gate, which is the earliest point at
+    /// which the answer is known: the orchestrator must already exist to
+    /// receive inbound messages while the gate is waiting, so this cannot be an
+    /// init parameter.
+    ///
+    /// Excluded peers are removed from the expected set entirely rather than
+    /// left to time out each round. A node that never joined is a permanent
+    /// absence: waiting the full peer deadline on it every round would cost
+    /// more than the rest of the round put together, and would report one
+    /// permanent failure as N transient ones.
+    ///
+    /// Must be called before `run()`; calling it later would change the
+    /// expected set mid-run, which is a different experiment (mid-run failure)
+    /// and is not what this is for.
+    public func excludePeers(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        // Logged before filtering, while the numeric IDs are still resolvable.
+        for (numericID, node) in peerByNumericID where ids.contains(node.id) {
+            try? metricsLogger.log(.excludedAtStartup(
+                fromNode: Int(localNumericID), toNode: Int(numericID),
+                peerID: node.id))
+        }
+        peerByNumericID = peerByNumericID.filter { !ids.contains($0.value.id) }
+        expectedSenderIDs = Set(peerByNumericID.keys)
+        activePeers = activePeers.filter { !ids.contains($0.id) }
     }
 
     /// Feeds an inbound GossipMessage into this orchestrator's collector —
@@ -367,47 +564,103 @@ public final class RoundOrchestrator {
         // individually (not just the aggregate gossipAggS phase already
         // captured in RoundMetrics).
         //
-        // IMPORTANT: a failed push still gets logged (so a failure is
-        // visible in peer_push_log.jsonl, not just silently absent), but
-        // is then RE-THROWN — matching this project's explicit fail-loud
-        // policy (see this file's header comment: a peer failure should
-        // stall/abort the round, not be silently tolerated). An earlier
-        // draft of this change caught the push error internally and never
-        // re-threw it, which would have silently changed that policy
-        // without flagging it — a push failure would have been logged but
-        // the round would have continued as if nothing went wrong. Fixed
-        // before this was ever sent.
-        try await withThrowingTaskGroup(of: Void.self) { taskGroup in
-            for peer in topology.peers {
+        // A failed push is always logged to peer_push_log.jsonl, so a failure
+        // is visible rather than silently absent. What happens NEXT depends on
+        // whether the run opted into failure tolerance.
+        //
+        // WITHOUT a peer deadline the error is re-thrown, preserving this
+        // project's fail-loud policy: a peer failure should stall or abort the
+        // round rather than be silently tolerated, so a real problem gets
+        // noticed and fixed instead of quietly degrading results.
+        //
+        // WITH a peer deadline set, the run has explicitly declared that peer
+        // loss is the thing being measured, and a push failure must not abort
+        // it. Killing a node mid-run previously took down every surviving node
+        // with `Connection refused` propagated to the top level — the receive
+        // side had a deadline while the SEND side had none, so the round never
+        // reached the point where the deadline would have applied.
+        //
+        // Peers that could not be pushed to are also treated as immediately
+        // unreachable for this round rather than being waited on: this node
+        // has direct evidence they are down, so spending the full deadline
+        // confirming it wastes the entire deadline every round for as long as
+        // the failure lasts.
+        // Pushes run CONCURRENTLY with the wait for peer updates, not before
+        // it. Both concern the same peers and the same failure, so running them
+        // in sequence made a dead peer cost the full budget twice per round.
+        // Overlapping them makes the round's gossip cost max(push, wait) rather
+        // than their sum.
+        //
+        // Safe because gossip is asynchronous by construction: a peer sends
+        // when its own round completes, and nothing about receiving requires
+        // this node to have finished sending. The barrier that matters is the
+        // wait, which is unchanged.
+        //
+        // Consequence for the metrics: gossipPushS and gossipWaitS now overlap
+        // in wall-clock terms and no longer sum to the gossip phase. Both are
+        // still individually meaningful — push duration and wait duration — but
+        // adding them together would double-count. Round wall-clock remains
+        // authoritative.
+        async let pushOutcome: Set<String> = withThrowingTaskGroup(of: String?.self) { taskGroup -> Set<String> in
+            for peer in activePeers {
                 taskGroup.addTask {
                     let address = GossipNodeAddress(host: peer.host, port: peer.port)
                     let pushStart = Date()
                     let peerNumericID = (try? peer.numericID()) ?? 0
 
                     do {
-                        try await self.client.push(outgoingMessage, to: address)
+                        try await self.pushWithRetry(outgoingMessage, to: address,
+                                                     peerName: peer.id, round: round)
                         let entry = PeerPushLogEntry(
                             round: round, fromNode: Int(self.localNumericID), toNode: Int(peerNumericID),
                             bytes: messageByteCount, pushDurationS: Date().timeIntervalSince(pushStart),
-                            success: true, timestamp: pushStart.timeIntervalSince1970
+                            success: true, timestamp: pushStart.timeIntervalSince1970,
+                            kind: .push, peerID: peer.id
                         )
                         try self.metricsLogger.log(entry)
+                        return nil
                     } catch {
                         let entry = PeerPushLogEntry(
                             round: round, fromNode: Int(self.localNumericID), toNode: Int(peerNumericID),
                             bytes: messageByteCount, pushDurationS: Date().timeIntervalSince(pushStart),
-                            success: false, timestamp: pushStart.timeIntervalSince1970
+                            success: false, timestamp: pushStart.timeIntervalSince1970,
+                            kind: .push, peerID: peer.id
                         )
                         try? self.metricsLogger.log(entry)  // best-effort log even on failure; don't let a logging error mask the real push error below
-                        throw error
+                        if self.config.peerDeadlineSeconds == nil {
+                            throw error      // fail-loud, as before
+                        }
+                        return peer.id       // tolerated; reported, not fatal
                     }
                 }
             }
-            try await taskGroup.waitForAll()
+            var failed: Set<String> = []
+            for try await id in taskGroup {
+                if let id { failed.insert(id) }
+            }
+            return failed
         }
         let gossipPushS = Date().timeIntervalSince(gossipStart)  // push-phase-only wall-clock — Python's gossip_push_s
 
-        // --- Wait (indefinitely) for every peer's update for THIS round ---
+        // --- Wait for every peer's update for THIS round, while pushes run ---
+        let waitStart = Date()
+        let waitOutcome = try await waitForAllPeerUpdates(round: UInt32(round))
+        let gossipWaitS = Date().timeIntervalSince(waitStart)
+
+        // Record WHICH peers were lost, not just how many. training_log.csv
+        // carries counts; RQ2's targeted-failure arm needs identities, because
+        // "killing a head costs more than killing a hub" cannot be verified
+        // from a number.
+        logPeerLosses(round: round, outcome: waitOutcome, waitedS: gossipWaitS)
+
+        let failedPushes = try await pushOutcome
+        if !failedPushes.isEmpty {
+            print("[round \(round)] push failed to \(failedPushes.count) peer(s) after "
+                  + "retrying: \(failedPushes.sorted().joined(separator: ", ")). "
+                  + "Still waiting for their updates — a peer we cannot reach may "
+                  + "well be able to reach us.")
+        }
+        // --- (push/wait now overlap; see above) ---
         //
         // TIMING NOTE, and a correction to what the previous comment here
         // claimed. `gossipAggS` was documented as "wait+aggregate wall-clock",
@@ -430,9 +683,16 @@ public final class RoundOrchestrator {
         // recorded under the old schema remain directly comparable with new
         // ones. `gossipWaitS` carries the same number under an honest name,
         // and `gossipAggregateS` adds the measurement that was missing.
-        let waitStart = Date()
-        let peerUpdates = try await waitForAllPeerUpdates(round: UInt32(round))
-        let gossipWaitS = Date().timeIntervalSince(waitStart)
+        // The wait itself is issued above, concurrently with the pushes.
+        //
+        // failedPushes is deliberately NOT used to skip waiting for those
+        // peers. A push failure means this node could not reach the peer at
+        // that instant; it does not mean the peer is down, and it says nothing
+        // about whether the peer can reach US — a peer whose update has already
+        // arrived may be one we just failed to push to. Treating push failure
+        // as proof of death converted transient busy-ness into whole rounds of
+        // spurious exclusion. Let the deadline decide, from actual silence.
+        let peerUpdates = waitOutcome.updates
 
         // Unchanged in value and meaning from every previous run: time from
         // the end of the push phase until every peer's update has arrived.
@@ -550,7 +810,7 @@ public final class RoundOrchestrator {
             effectiveCores: effectiveCores,
             shufS: trainResult.shufS,
             peakRSSMB: ResourceUsage.peakRSSMB(),
-            bytesSent: messageByteCount * Int64(topology.peers.count),  // one push per peer, all the same size — see messageByteCount's own comment for why it's computed once per round rather than per-peer
+            bytesSent: messageByteCount * Int64(activePeers.count),  // one push per peer, all the same size — see messageByteCount's own comment for why it's computed once per round rather than per-peer
             bytesReceived: RoundMetricsPlaceholders.bytesReceived,
             peersReached: peerUpdates.count,
             peersExpected: expectedSenderIDs.count,
@@ -562,7 +822,13 @@ public final class RoundOrchestrator {
             testLoss: testEval.loss,
             localAcc: localEval.accuracy,
             localLoss: localEval.loss,
-            status: .completed,
+            // A round that aggregated over fewer peers than expected is NOT
+            // `.completed`. Recording it as such would make a degraded round
+            // indistinguishable from a healthy one in the results — and under
+            // the failure regimes that distinction IS the measurement.
+            status: (waitOutcome.timedOut.isEmpty
+                     && waitOutcome.churnDropped.isEmpty)
+                    ? .completed : .partialPeersUnreachable,
             // Schema v3 arguments go LAST, matching the order they are
             // declared in RoundMetrics.init. They were appended there (with
             // -1 defaults) so that adding them could not break any existing
@@ -570,36 +836,118 @@ public final class RoundOrchestrator {
             // the end of the argument list here, not beside the gossip
             // parameters they logically belong with. Placing them next to
             // gossipAggS reads better and does not compile.
+            // Argument order must match RoundMetrics.init's declaration order:
+            // peersTimedOut is a schema-v2 field and therefore precedes the v3
+            // gossip timings, while peersChurnDropped is v4 and follows them.
+            peersTimedOut: waitOutcome.timedOut.count,
             gossipWaitS: gossipWaitS,
-            gossipAggregateS: gossipAggregateS
+            gossipAggregateS: gossipAggregateS,
+            peersChurnDropped: waitOutcome.churnDropped.count
         )
     }
 
-    /// Waits, with NO timeout, until every ID in `expectedSenderIDs` has a
-    /// recorded message for `round`. Prints a heartbeat every
-    /// `config.heartbeatIntervalSeconds` naming exactly which peer(s) are
-    /// still missing, so a human watching the process can tell it's alive
-    /// and see what it's blocked on rather than staring at silence.
-    private func waitForAllPeerUpdates(round: UInt32) async throws -> [UInt32: GossipMessage] {
-        guard !expectedSenderIDs.isEmpty else { return [:] }
+    /// Outcome of one round's wait for peer updates.
+    struct PeerWaitOutcome {
+        let updates: [UInt32: GossipMessage]
+        /// Peers whose update never arrived before the deadline.
+        let timedOut: Set<UInt32>
+        /// Peers whose update DID arrive but was dropped by churn injection.
+        let churnDropped: Set<UInt32>
+    }
 
+    /// Waits until every ID in `expectedSenderIDs` has a recorded message for
+    /// `round`, or until `config.peerDeadlineSeconds` elapses.
+    ///
+    /// With no deadline configured this blocks indefinitely, exactly as before
+    /// — the original behaviour, preserved by default. See
+    /// `RoundOrchestratorConfig.peerDeadlineSeconds` for why that was the right
+    /// default and why it nonetheless has to be overridable.
+    ///
+    /// A heartbeat every `config.heartbeatIntervalSeconds` names the missing
+    /// peers, so a human watching can tell the process is alive and see what it
+    /// is blocked on rather than staring at silence.
+    ///
+    /// LATE UPDATES ARE DISCARDED, not carried into the next round. Accepting
+    /// them would make the protocol partially asynchronous — a different
+    /// algorithm, not a failure-tolerance policy, and one whose convergence
+    /// behaviour would confound every topology comparison it appeared in. The
+    /// collector keys messages by round, so a late arrival is simply never
+    /// consulted again.
+    private func waitForAllPeerUpdates(round: UInt32) async throws -> PeerWaitOutcome {
+        guard !expectedSenderIDs.isEmpty else {
+            return PeerWaitOutcome(updates: [:], timedOut: [], churnDropped: [])
+        }
+
+        let deadline = config.peerDeadlineSeconds.map { Date().addingTimeInterval($0) }
         var lastHeartbeat = Date()
+
         while true {
-            let (received, missing) = await collector.currentStatus(round: round, expectedSenderIDs: expectedSenderIDs)
+            let (received, missing) = await collector.currentStatus(
+                round: round, expectedSenderIDs: expectedSenderIDs)
+
             if missing.isEmpty {
-                return received
+                return applyChurn(to: received, round: round, timedOut: [])
+            }
+
+            if let deadline, Date() >= deadline {
+                let names = missing.compactMap { peerByNumericID[$0]?.id }.sorted()
+                print("[round \(round)] deadline reached after "
+                      + "\(config.peerDeadlineSeconds!.rounded())s — proceeding "
+                      + "with \(received.count)/\(expectedSenderIDs.count) peer(s). "
+                      + "Missing: \(names.joined(separator: ", "))")
+                return applyChurn(to: received, round: round, timedOut: missing)
             }
 
             if Date().timeIntervalSince(lastHeartbeat) >= config.heartbeatIntervalSeconds {
                 let missingNames = missing.compactMap { peerByNumericID[$0]?.id }
-                print("[round \(round)] still waiting on \(missing.count) peer(s): \(missingNames.joined(separator: ", "))")
+                var msg = "[round \(round)] still waiting on \(missing.count) peer(s): "
+                        + "\(missingNames.joined(separator: ", "))"
+                if let deadline {
+                    msg += String(format: " (%.0fs until deadline)",
+                                  deadline.timeIntervalSinceNow)
+                }
+                print(msg)
                 lastHeartbeat = Date()
             }
 
             try await Task.sleep(nanoseconds: 500_000_000)  // 0.5s poll interval — cheap, frequent enough that the heartbeat interval itself (not this) governs perceived responsiveness
         }
     }
+
+    /// Drops received updates according to the configured churn probability.
+    ///
+    /// Applied AFTER the wait rather than by refusing to record the message,
+    /// so a churned peer still counts as having arrived on time. That keeps the
+    /// two failure modes separable in the logs: `timed_out` means the update
+    /// never came, `churn_dropped` means it came and was deliberately ignored.
+    /// Conflating them would make a slow network indistinguishable from an
+    /// unreliable one.
+    private func applyChurn(to received: [UInt32: GossipMessage],
+                            round: UInt32,
+                            timedOut: Set<UInt32>) -> PeerWaitOutcome {
+        guard config.churnDropProbability > 0 else {
+            return PeerWaitOutcome(updates: received, timedOut: timedOut,
+                                   churnDropped: [])
+        }
+        var kept: [UInt32: GossipMessage] = [:]
+        var dropped: Set<UInt32> = []
+        for (peerID, msg) in received {
+            if config.shouldDropPeer(round: Int(round), peerID: peerID) {
+                dropped.insert(peerID)
+            } else {
+                kept[peerID] = msg
+            }
+        }
+        if !dropped.isEmpty {
+            let names = dropped.compactMap { peerByNumericID[$0]?.id }.sorted()
+            print("[round \(round)] churn dropped \(dropped.count) peer update(s): "
+                  + "\(names.joined(separator: ", "))")
+        }
+        return PeerWaitOutcome(updates: kept, timedOut: timedOut,
+                               churnDropped: dropped)
+    }
 }
+
 
 
 

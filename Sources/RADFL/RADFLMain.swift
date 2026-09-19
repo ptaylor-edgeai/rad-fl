@@ -16,6 +16,26 @@ import Foundation
 import NIOPosix
 import RADFLCore
 
+/// Collects which peers reported reachable during the startup gate.
+///
+/// A small locked box rather than a plain Set because `waitForAllReachable`'s
+/// status callback is `@Sendable` and may fire from any task — mutating a
+/// captured Set directly is a data race, and the compiler will say so.
+final class ReadyPeerTracker: @unchecked Sendable {
+    private var ready: Set<String> = []
+    private let lock = NSLock()
+
+    func markReady(_ id: String) {
+        lock.lock(); defer { lock.unlock() }
+        ready.insert(id)
+    }
+
+    func readyIDs() -> Set<String> {
+        lock.lock(); defer { lock.unlock() }
+        return ready
+    }
+}
+
 @main
 struct RADFLMain {
     static func main() async throws {
@@ -119,6 +139,8 @@ struct RADFLMain {
                             compiler — this is the first real check of its correctness,
                             the same way test-cnn was for Tensor.swift's other primitives.)
                            [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--batch-size <n>] [--output-dir <path>]
+                           [--peer-deadline-s <f>] [--startup-deadline-s <f>] [--push-retry-s <f>]
+                           [--churn-drop <p>] [--churn-seed <n>]
                            (runs the FULL federated learning loop for real, on real
                             hardware: starts this node's GossipServer, loads its real
                             train/test shards via CIFAR10Shard, builds a SimpleCNN, and
@@ -159,7 +181,30 @@ struct RADFLMain {
                             fields are PLACEHOLDER VALUES (-1) in this version — the -1
                             sentinel means NOT INSTRUMENTED, explicitly distinct from a
                             measured zero; see RoundMetrics.swift. Defaults: 5 rounds,
-                            learning rate 0.01, batch size 32, seed 42.)
+                            learning rate 0.01, batch size 32, seed 42.
+                            FAILURE REGIMES: there are TWO waits and they need separate
+                            deadlines. --startup-deadline-s bounds the wait before round 1
+                            for every peer to become reachable; peers still down when it
+                            expires are EXCLUDED from the run entirely (not pushed to, not
+                            waited for) and named in run_config.json, since a node that
+                            never joined is a permanent absence rather than a per-round
+                            timeout. --push-retry-s (default 15) bounds how
+                            long a failed push is retried: a peer mid-training cannot
+                            accept connections, because concurrentPerform starves the NIO
+                            event loop, so a refused connection means BUSY rather than
+                            DEAD. Pushes run concurrently with the wait, so a round's
+                            gossip cost is max(push, wait) rather than their sum — note
+                            that gossip_push_s and gossip_wait_s therefore overlap and must
+                            not be added together. --peer-deadline-s bounds the wait for peer
+                            updates; without it a stalled peer blocks the round forever
+                            (the original behaviour, kept as the default so a deadline can
+                            never mask an unintended stall). Rounds that proceed without a
+                            peer are logged as partial_peers_unreachable, with the count in
+                            peers_timed_out. --churn-drop p discards each arrived peer
+                            update with probability p, deterministically derived from
+                            (--churn-seed, round, peer) so a churn pattern reproduces
+                            exactly; those are counted separately in peers_churn_dropped,
+                            since an unreliable link and a slow one are different failures.)
             """)
             return
         }
@@ -497,6 +542,26 @@ struct RADFLMain {
                 // default is unchanged at 32, so every existing invocation
                 // behaves exactly as before.
                 let batchSize = Int(arg("--batch-size", in: args) ?? "32") ?? 32
+
+                // Failure-regime controls. All default to the pre-existing
+                // behaviour: no deadline (wait indefinitely) and no churn, so
+                // omitting them reproduces every run recorded so far.
+                let peerDeadline = arg("--peer-deadline-s", in: args).flatMap { Double($0) }
+                let churnDrop = Double(arg("--churn-drop", in: args) ?? "0") ?? 0
+                let churnSeed = UInt64(arg("--churn-seed", in: args) ?? "0") ?? 0
+                let pushRetry = Double(arg("--push-retry-s", in: args) ?? "15") ?? 15
+
+                // Startup readiness deadline, distinct from the per-round peer
+                // deadline. There are TWO waits in a run and they fail
+                // differently: this one blocks before round 1 until every peer
+                // is reachable, the other bounds each round's wait for updates.
+                //
+                // The round deadline alone does not help a node that never
+                // starts — the run never reaches the round loop to apply it.
+                // A crash regime where the failed node simply never joins would
+                // therefore hang forever despite a peer deadline being set,
+                // which is exactly what happened on the first attempt.
+                let startupDeadline = arg("--startup-deadline-s", in: args).flatMap { Double($0) }
                 let outputBaseStr = arg("--output-dir", in: args) ?? "results"
 
                 // Single shared output directory for EVERYTHING this run
@@ -585,8 +650,25 @@ struct RADFLMain {
                 )
 
                 let orchestratorConfig = RoundOrchestratorConfig(
-                    totalRounds: rounds, condition: condition, baseSeed: seed, learningRate: learningRate
+                    totalRounds: rounds, condition: condition, baseSeed: seed,
+                    learningRate: learningRate,
+                    peerDeadlineSeconds: peerDeadline,
+                    churnDropProbability: churnDrop,
+                    churnSeed: churnSeed,
+                    pushRetrySeconds: pushRetry
                 )
+                if let peerDeadline {
+                    print("[run-round] peer deadline \(peerDeadline)s — rounds will "
+                          + "proceed with whatever peers have arrived by then, and "
+                          + "are logged as partial_peers_unreachable")
+                } else {
+                    print("[run-round] no peer deadline — a stalled peer will block "
+                          + "this node indefinitely, by design")
+                }
+                if churnDrop > 0 {
+                    print("[run-round] churn injection: \(churnDrop) drop probability "
+                          + "per peer per round, churn seed \(churnSeed)")
+                }
                 let orchestrator = try RoundOrchestrator(
                     model: model, topology: topology, config: orchestratorConfig,
                     client: client, collector: collector, metricsLogger: metricsLogger,
@@ -647,19 +729,33 @@ struct RADFLMain {
                 // a concrete TimeAmount; this matches the project's
                 // explicit "no timeout" policy for this development phase
                 // in spirit, just not literally infinite.
-                print("[run-round] waiting for all \(topology.peers.count) peer(s) to be reachable before starting...")
+                if let startupDeadline {
+                    print("[run-round] waiting up to \(Int(startupDeadline))s for "
+                          + "\(topology.peers.count) peer(s); any still unreachable will be "
+                          + "EXCLUDED from this run")
+                } else {
+                    print("[run-round] waiting for all \(topology.peers.count) peer(s) to be reachable before starting...")
+                }
                 let readinessClient = GossipClient(group: group)
                 let peerAddresses = topology.peers.map { GossipNodeAddress(host: $0.host, port: $0.port) }
                 let peerNameByAddress = Dictionary(uniqueKeysWithValues: topology.peers.map {
                     (GossipNodeAddress(host: $0.host, port: $0.port), $0.id)
                 })
+
+                // Which peers actually came up. Accumulated from the status
+                // callback rather than taken from waitForAllReachable's return
+                // value, so this works regardless of what that function reports
+                // on timeout.
+                let readyTracker = ReadyPeerTracker()
+
                 _ = await waitForAllReachable(
                     client: readinessClient,
                     addresses: peerAddresses,
-                    timeout: .seconds(Int64(365 * 24 * 60 * 60)),
+                    timeout: .seconds(Int64(startupDeadline.map { Int($0) } ?? (365 * 24 * 60 * 60))),
                     onStatusChange: { address, status in
                         if status == .reachable {
                             let name = peerNameByAddress[address] ?? "\(address.host):\(address.port)"
+                            readyTracker.markReady(name)
                             print("[run-round] \(name) is up")
                         }
                     },
@@ -667,7 +763,32 @@ struct RADFLMain {
                         print("[run-round] waiting for peers to come up: \(reachableCount)/\(totalCount) ready so far")
                     }
                 )
-                print("[run-round] all peers reachable — starting \(rounds) round(s)...")
+
+                let ready = readyTracker.readyIDs()
+                let excludedPeerIDs = Set(topology.peers.map(\.id)).subtracting(ready)
+
+                if excludedPeerIDs.isEmpty {
+                    print("[run-round] all peers reachable — starting \(rounds) round(s)...")
+                } else if startupDeadline != nil {
+                    // Excluded from the expected set entirely rather than left
+                    // to time out every round: a node that never joined is a
+                    // permanent absence, not 25 separate transient failures,
+                    // and waiting the full deadline on it each round would cost
+                    // more than the rest of the round put together.
+                    print("[run-round] startup deadline reached — EXCLUDING "
+                          + "\(excludedPeerIDs.count) unreachable peer(s): "
+                          + "\(excludedPeerIDs.sorted().joined(separator: ", "))")
+                    print("[run-round] proceeding with \(ready.count)/\(topology.peers.count) "
+                          + "peer(s) for all \(rounds) round(s)")
+                    orchestrator.excludePeers(excludedPeerIDs)
+                } else {
+                    // No deadline set, yet peers are missing — waitForAllReachable
+                    // returned early for some other reason. Do not silently
+                    // proceed with a reduced set when the run did not ask for it.
+                    print("[run-round] WARNING: \(excludedPeerIDs.count) peer(s) still "
+                          + "unreachable but no --startup-deadline-s was set: "
+                          + "\(excludedPeerIDs.sorted().joined(separator: ", "))")
+                }
 
                 // Save modelConfig as config.json INTO outputDir, BEFORE
                 // training starts (not just at the end alongside the
@@ -723,6 +844,9 @@ struct RADFLMain {
                     rounds: rounds,
                     learningRate: learningRate,
                     batchSize: batchSize,
+                    peerDeadlineSeconds: peerDeadline,
+                    churnDropProbability: churnDrop,
+                    churnSeed: churnSeed,
                     dataDirectory: dataDir.path,
                     outputDirectory: outputDir.path,
                     trainSampleCount: trainShard.sampleCount,
@@ -731,6 +855,7 @@ struct RADFLMain {
                     topologyPath: arg("--topology", in: args) ?? "topology.json",
                     topologyMode: topology.mode.rawValue,
                     peerIDs: topology.peers.map(\.id),
+                    excludedPeerIDs: Array(excludedPeerIDs),
                     modelConfig: modelConfig
                 )
                 try runConfig.write(to: outputDir)
@@ -1262,5 +1387,6 @@ struct RADFLMain {
         return topology
     }
 }
+
 
 

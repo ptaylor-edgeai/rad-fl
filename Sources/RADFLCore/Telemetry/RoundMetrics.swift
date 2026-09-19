@@ -45,6 +45,9 @@
 //        gossip_agg_s keeps exactly the value it has always had, so v2 runs
 //        stay directly comparable with v3 ones. See those fields for what
 //        the previous instrumentation was actually measuring.
+//   v4 — adds peers_churn_dropped, for the failure regimes. peers_timed_out
+//        (v2) becomes populated at the same time, having been a -1 sentinel
+//        until the round deadline existed to produce it.
 
 import Foundation
 
@@ -57,7 +60,7 @@ public struct RoundMetrics: Sendable, Codable {
     /// CSV/struct schema version. Bump when columns are added so analysis code
     /// can dispatch on an explicit number rather than sniffing for the presence
     /// of a column and guessing.
-    public static let schemaVersion: Int = 3
+    public static let schemaVersion: Int = 4
 
     public let round: Int
     public let nodeID: Int
@@ -126,6 +129,15 @@ public struct RoundMetrics: Sendable, Codable {
     /// which is exactly when a topology comparison needs it attributed rather
     /// than lost.
     public let gossipAggregateS: Double
+
+    /// Peers whose update ARRIVED but was deliberately discarded by churn
+    /// injection.
+    ///
+    /// Kept distinct from `peersTimedOut`, which counts updates that never
+    /// came. Conflating them would make an unreliable network
+    /// indistinguishable from a slow one — and separating those is the whole
+    /// point of running a churn regime alongside a crash regime.
+    public let peersChurnDropped: Int
     public let roundTotalS: Double        // EXCLUDES evalTotalS — see evalTotalS's doc comment; true total wall-clock is roundTotalS + evalTotalS
 
     // Wall-clock round-end marker — Python's `timestamp` column, written by
@@ -299,7 +311,9 @@ public struct RoundMetrics: Sendable, Codable {
         // not yet been updated records honestly instead of claiming a measured
         // zero for a phase it never timed.
         gossipWaitS: Double = -1,
-        gossipAggregateS: Double = -1
+        gossipAggregateS: Double = -1,
+        // ── schema v4 ───────────────────────────────────────────────────────
+        peersChurnDropped: Int = -1
     ) {
         self.round = round
         self.nodeID = nodeID
@@ -340,6 +354,7 @@ public struct RoundMetrics: Sendable, Codable {
         self.achievedFreqKHz = achievedFreqKHz
         self.gossipWaitS = gossipWaitS
         self.gossipAggregateS = gossipAggregateS
+        self.peersChurnDropped = peersChurnDropped
     }
 }
 
@@ -350,9 +365,37 @@ public enum RoundStatus: String, Sendable, Codable {
     case crashed
 }
 
-/// One line in peer_push_log.jsonl — mirrors the Python field for per-push
-/// communication diagnostics (RQ2/RQ3 instrumentation, captured now per the
-/// project's "instrument now, analyze later" philosophy).
+/// What a peer_push_log.jsonl line describes.
+///
+/// The file began as a push-only log, which is why the type is named for
+/// pushes. Under the failure regimes it also has to record what happened on
+/// the RECEIVE side, because `training_log.csv` carries only counts —
+/// `peers_timed_out: 1` says a peer was lost, not WHICH peer.
+///
+/// That distinction is the measurement in RQ2's targeted-failure arm: the
+/// claim is that killing a cluster head costs more than killing a high-degree
+/// hub, and verifying it requires knowing the failure was the head. Push
+/// failures alone cannot supply it — a peer this node failed to push to is not
+/// necessarily the peer that failed to send, which is precisely the asymmetry
+/// observed when a node received weights from a peer it could not reach.
+public enum PeerEventKind: String, Sendable, Codable {
+    /// A push attempt, successful or not. `success` carries which.
+    case push
+    /// A peer's update never arrived before the round deadline.
+    case timeout
+    /// A peer's update arrived and was deliberately discarded by churn
+    /// injection. Distinct from `timeout`: an unreliable link and a slow one
+    /// are different failures, and separating them is the point of running a
+    /// churn regime alongside a crash regime.
+    case churnDropped = "churn_dropped"
+    /// A peer was unreachable at startup and excluded from the whole run.
+    case excludedAtStartup = "excluded_at_startup"
+}
+
+/// One line in peer_push_log.jsonl — per-peer communication diagnostics.
+///
+/// `kind` distinguishes the event types; older files contain only pushes and
+/// have no `kind` field, so readers should default a missing value to `.push`.
 public struct PeerPushLogEntry: Sendable, Codable {
     public let round: Int
     public let fromNode: Int
@@ -361,8 +404,16 @@ public struct PeerPushLogEntry: Sendable, Codable {
     public let pushDurationS: Double
     public let success: Bool
     public let timestamp: Double  // unix epoch seconds, matches Python's time.time() convention
+    public let kind: PeerEventKind
+    /// Peer's topology ID (e.g. "pi-10"). Numeric IDs are what the wire
+    /// protocol uses, but every analysis groups by topology ID, and resolving
+    /// one to the other after the fact needs the topology file that produced
+    /// the run — which is exactly what goes missing.
+    public let peerID: String?
 
-    public init(round: Int, fromNode: Int, toNode: Int, bytes: Int64, pushDurationS: Double, success: Bool, timestamp: Double) {
+    public init(round: Int, fromNode: Int, toNode: Int, bytes: Int64,
+                pushDurationS: Double, success: Bool, timestamp: Double,
+                kind: PeerEventKind = .push, peerID: String? = nil) {
         self.round = round
         self.fromNode = fromNode
         self.toNode = toNode
@@ -370,6 +421,35 @@ public struct PeerPushLogEntry: Sendable, Codable {
         self.pushDurationS = pushDurationS
         self.success = success
         self.timestamp = timestamp
+        self.kind = kind
+        self.peerID = peerID
+    }
+
+    /// A peer whose update never arrived before the deadline.
+    public static func timeout(round: Int, fromNode: Int, toNode: Int,
+                               peerID: String, waitedS: Double) -> PeerPushLogEntry {
+        PeerPushLogEntry(round: round, fromNode: fromNode, toNode: toNode,
+                         bytes: 0, pushDurationS: waitedS, success: false,
+                         timestamp: Date().timeIntervalSince1970,
+                         kind: .timeout, peerID: peerID)
+    }
+
+    /// A peer's update that arrived and was discarded by churn injection.
+    public static func churnDropped(round: Int, fromNode: Int, toNode: Int,
+                                    peerID: String) -> PeerPushLogEntry {
+        PeerPushLogEntry(round: round, fromNode: fromNode, toNode: toNode,
+                         bytes: 0, pushDurationS: 0, success: false,
+                         timestamp: Date().timeIntervalSince1970,
+                         kind: .churnDropped, peerID: peerID)
+    }
+
+    /// A peer excluded before round 1 because it never became reachable.
+    public static func excludedAtStartup(fromNode: Int, toNode: Int,
+                                         peerID: String) -> PeerPushLogEntry {
+        PeerPushLogEntry(round: 0, fromNode: fromNode, toNode: toNode,
+                         bytes: 0, pushDurationS: 0, success: false,
+                         timestamp: Date().timeIntervalSince1970,
+                         kind: .excludedAtStartup, peerID: peerID)
     }
 }
 
