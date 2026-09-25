@@ -221,13 +221,41 @@ public struct RoundOrchestratorConfig: Sendable {
     /// topology therefore cannot be combined without revisiting this.
     public let compression: GossipEncoding
 
+    /// Evaluate the test set and local shard every N rounds, rather than every
+    /// round. 1 (the default) preserves the original behaviour exactly.
+    ///
+    /// The final round is ALWAYS evaluated, whatever N is, so final accuracy is
+    /// available for every run and runs at different cadences remain comparable
+    /// on it.
+    ///
+    /// This is RQ3's largest single lever. Evaluation is half of every round on
+    /// this hardware (F-001) — the test set alone is ~22s of an ~88s round — and,
+    /// unlike gossip wait, it runs forward passes at full CPU load. So skipping
+    /// it saves ENERGY in proportion to the time saved, where removing gossip
+    /// wait saves only about half as much energy as time (F-012), because that
+    /// time was spent near the idle floor.
+    ///
+    /// On a skipped round the accuracy and loss fields are nil, which the CSV
+    /// writes as empty and the analysis reads as missing. The evaluation TIMES
+    /// are zero rather than nil: no evaluation happened, so zero seconds is a
+    /// measurement, and round wall-clock (round_total_s + eval_total_s) stays
+    /// correct. The distinction is the same one the -1 sentinel draws elsewhere
+    /// — not measured versus measured-as-zero — expressed through the types
+    /// these fields already had.
+    ///
+    /// Rounds-to-target resolves only to N rounds under this setting: a run
+    /// that crosses the threshold at round 13 with N=5 is first observed doing
+    /// so at round 15. Report the cadence alongside any convergence figure.
+    public let evalEvery: Int
+
     public init(totalRounds: Int, condition: String, baseSeed: UInt64,
                 learningRate: Float, heartbeatIntervalSeconds: Double = 20,
                 peerDeadlineSeconds: Double? = nil,
                 churnDropProbability: Double = 0.0,
                 churnSeed: UInt64 = 0,
                 pushRetrySeconds: Double? = nil,
-                compression: GossipEncoding = .dense) {
+                compression: GossipEncoding = .dense,
+                evalEvery: Int = 1) {
         self.totalRounds = totalRounds
         self.condition = condition
         self.baseSeed = baseSeed
@@ -238,6 +266,13 @@ public struct RoundOrchestratorConfig: Sendable {
         self.churnSeed = churnSeed
         self.pushRetrySeconds = pushRetrySeconds
         self.compression = compression
+        self.evalEvery = max(1, evalEvery)
+    }
+
+    /// Whether `round` is evaluated. Rounds are 1-based; the final round is
+    /// always evaluated.
+    func shouldEvaluate(round: Int) -> Bool {
+        evalEvery <= 1 || round % evalEvery == 0 || round == totalRounds
     }
 
 
@@ -356,6 +391,10 @@ public final class RoundOrchestrator {
         self.expectedSenderIDs = Set(byID.keys)
         self.activePeers = topology.peers
 
+        if config.evalEvery > 1 {
+            print("[orchestrator] evaluating every \(config.evalEvery) rounds "
+                  + "(and always the final round); accuracy is empty on the others")
+        }
         if config.compression != .dense {
             print("[orchestrator] compression: \(config.compression) "
                   + "(lossy: \(config.compression.isLossy)) — applied to outbound "
@@ -440,6 +479,17 @@ public final class RoundOrchestrator {
                 backoff = min(backoff * 2, 5_000_000_000)
             }
         }
+    }
+
+    /// Runs `body` only when `flag` is set, otherwise returns nil.
+    ///
+    /// A plain `if` rather than `flag ? try body() : nil`: Swift rejects `try`
+    /// to the right of an operator in some positions, and a helper sidesteps
+    /// the question without depending on which ones. Also keeps the call sites
+    /// to one line each.
+    private static func runIf<T>(_ flag: Bool, _ body: () throws -> T) rethrows -> T? {
+        if flag { return try body() }
+        return nil
     }
 
     /// Removes peers that never became reachable from this run.
@@ -868,14 +918,25 @@ public final class RoundOrchestrator {
         // Evaluating test_acc pre-aggregation produced a systematic gap
         // (~0.18 lower than Python) because each node's locally-trained model
         // is less generalizable than the aggregated model.
-        let testEval  = try model.evaluate(shard: testShard)
-        let localEval = try model.evaluate(shard: trainShard)
+        // Skipped on rounds outside the evaluation cadence — see
+        // RoundOrchestratorConfig.evalEvery. Both passes share one cadence:
+        // the test set carries the headline number and the local shard is a
+        // diagnostic, so there is no configuration in which evaluating only
+        // the diagnostic would be the useful choice.
+        let doEval = config.shouldEvaluate(round: round)
+        let testEval  = try Self.runIf(doEval) { try model.evaluate(shard: testShard) }
+        let localEval = try Self.runIf(doEval) { try model.evaluate(shard: trainShard) }
 
         // roundTotalS EXCLUDES both eval passes — matching Python's documented
         // convention exactly (round_total_s deliberately excludes eval;
         // true total is round_total_s + eval_total_s where
         // eval_total_s = eval_test_s + eval_local_s).
-        let evalTotalS = testEval.evalS + localEval.evalS
+        // Zero, not nil, on a skipped round: no evaluation ran, so zero seconds
+        // is what was measured. Keeps round_total_s + eval_total_s equal to
+        // round wall-clock whatever the cadence.
+        let evalTestS  = testEval?.evalS ?? 0
+        let evalLocalS = localEval?.evalS ?? 0
+        let evalTotalS = evalTestS + evalLocalS
         // Captured once and reused as both the roundTotalS anchor and the
         // RoundMetrics timestamp, rather than calling Date() a second time
         // a few lines later — keeps the two values referring to the exact
@@ -896,8 +957,8 @@ public final class RoundOrchestrator {
             bwdS: trainResult.bwdS,
             optS: trainResult.optS,
             evalTotalS: evalTotalS,
-            evalTestS: testEval.evalS,
-            evalLocalS: localEval.evalS,
+            evalTestS: evalTestS,
+            evalLocalS: evalLocalS,
             gossipPushS: gossipPushS,
             gossipAggS: gossipAggS,
             roundTotalS: roundTotalS,
@@ -913,10 +974,12 @@ public final class RoundOrchestrator {
             nSamples: trainShard.sampleCount,
             trainLoss: trainResult.meanLoss,
             trainAcc: trainResult.trainAcc,
-            testAcc: testEval.accuracy,
-            testLoss: testEval.loss,
-            localAcc: localEval.accuracy,
-            localLoss: localEval.loss,
+            // nil on a skipped round — written as an empty field, read as
+            // missing. Never a fabricated value.
+            testAcc: testEval?.accuracy,
+            testLoss: testEval?.loss,
+            localAcc: localEval?.accuracy,
+            localLoss: localEval?.loss,
             // A round that aggregated over fewer peers than expected is NOT
             // `.completed`. Recording it as such would make a degraded round
             // indistinguishable from a healthy one in the results — and under

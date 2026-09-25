@@ -233,6 +233,10 @@ public struct RunConfig: Codable {
     /// message and per-tensor headers are not compressed.
     public let compression: String
 
+    /// Evaluate every N rounds; 1 means every round. Needed to interpret
+    /// rounds-to-target, which resolves only to N rounds under this setting.
+    public let evalEvery: Int
+
     // Data
     public let dataDirectory: String
     public let outputDirectory: String
@@ -292,6 +296,7 @@ public struct RunConfig: Codable {
         churnDropProbability: Double = 0,
         churnSeed: UInt64 = 0,
         compression: String = "none",
+        evalEvery: Int = 1,
         dataDirectory: String,
         outputDirectory: String,
         trainSampleCount: Int,
@@ -324,6 +329,7 @@ public struct RunConfig: Codable {
         self.churnDropProbability = churnDropProbability
         self.churnSeed = churnSeed
         self.compression = compression
+        self.evalEvery = evalEvery
 
         self.dataDirectory = dataDirectory
         self.outputDirectory = outputDirectory
@@ -369,6 +375,7 @@ public struct RunConfig: Codable {
         let cores = "\(systemState.cpuAffinityCount)/\(systemState.cpuOnlineCount)"
         let regime = peerDeadlineSeconds.map { "deadline=\($0)s" } ?? "no-deadline"
         let comp = compression == "none" ? "" : " compression=\(compression)"
+            + (evalEvery > 1 ? " eval-every=\(evalEvery)" : "")
         let excl = excludedPeerIDs.isEmpty ? ""
                  : " excluded=\(excludedPeerIDs.joined(separator: ","))"
         let churn = churnDropProbability > 0 ? " churn=\(churnDropProbability)" : ""

@@ -139,7 +139,7 @@ struct RADFLMain {
                             compiler — this is the first real check of its correctness,
                             the same way test-cnn was for Tensor.swift's other primitives.)
                            [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--batch-size <n>] [--output-dir <path>]
-                           [--compression none|fp16|int8]
+                           [--compression none|fp16|int8] [--eval-every <n>]
                            [--peer-deadline-s <f>] [--startup-deadline-s <f>] [--push-retry-s <f>]
                            [--churn-drop <p>] [--churn-seed <n>]
                            (runs the FULL federated learning loop for real, on real
@@ -183,6 +183,13 @@ struct RADFLMain {
                             sentinel means NOT INSTRUMENTED, explicitly distinct from a
                             measured zero; see RoundMetrics.swift. Defaults: 5 rounds,
                             learning rate 0.01, batch size 32, seed 42.
+                            EVALUATION CADENCE: --eval-every N evaluates the test set and
+                            local shard every N rounds instead of every round; the final
+                            round is always evaluated. Evaluation is half of every round
+                            on this hardware and runs at full CPU load, so this saves
+                            energy in proportion to time — unlike reducing communication,
+                            whose time was spent near idle. Accuracy is empty on skipped
+                            rounds; evaluation time is recorded as zero.
                             COMPRESSION: --compression selects how parameter tensors are
                             encoded for transmission. fp16 halves the payload at ~2e-04 max
                             error; int8 quarters it at ~4e-03. Both are lossy and apply to
@@ -572,6 +579,16 @@ struct RADFLMain {
                 // unknown value: silently falling back to dense would produce a
                 // run labelled as compressed that was not, and the results
                 // would be indistinguishable from a correct dense baseline.
+                // Evaluation cadence. Rejected rather than clamped on a bad value,
+                // for the same reason as --compression: a silent fallback to 1
+                // would produce a run labelled as reduced-cadence that was not.
+                let evalEveryArg = arg("--eval-every", in: args) ?? "1"
+                guard let evalEvery = Int(evalEveryArg), evalEvery >= 1 else {
+                    FileHandle.standardError.write(Data(
+                        "error: --eval-every must be a positive integer, got '\(evalEveryArg)'\n".utf8))
+                    exit(2)
+                }
+
                 let compressionArg = (arg("--compression", in: args) ?? "none").lowercased()
                 let compression: GossipEncoding
                 switch compressionArg {
@@ -698,7 +715,8 @@ struct RADFLMain {
                     churnDropProbability: churnDrop,
                     churnSeed: churnSeed,
                     pushRetrySeconds: pushRetry,
-                    compression: compression
+                    compression: compression,
+                    evalEvery: evalEvery
                 )
                 if let peerDeadline {
                     print("[run-round] peer deadline \(peerDeadline)s — rounds will "
@@ -891,6 +909,7 @@ struct RADFLMain {
                     churnDropProbability: churnDrop,
                     churnSeed: churnSeed,
                     compression: compressionArg,
+                    evalEvery: evalEvery,
                     dataDirectory: dataDir.path,
                     outputDirectory: outputDir.path,
                     trainSampleCount: trainShard.sampleCount,
