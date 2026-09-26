@@ -35,18 +35,52 @@ public struct CNNTrainerConfig: Sendable {
     public let learningRate: Float
     public let seed: UInt64
 
-    public init(batchSize: Int, epochsPerRound: Int, learningRate: Float, seed: UInt64) {
+    /// Whether to run the post-training accuracy pass. Default true, which is
+    /// the original behaviour.
+    ///
+    /// That pass is a full sequential forward pass over the entire local shard
+    /// — the same work as an evaluation, and measured at ~11s on a 5,000-sample
+    /// shard, about 12% of an 88-second round. It was never timed, so it
+    /// appeared only as an unattributed remainder between round wall-clock and
+    /// the sum of the logged phases; F-001 identified it by dividing that
+    /// remainder by the per-sample evaluation rate, which implied 4,963 samples
+    /// against a shard of 5,000.
+    ///
+    /// It is a diagnostic, not a result. `local_acc` measures nearly the same
+    /// quantity — accuracy on this node's own shard — differing only in using
+    /// post-aggregation rather than pre-aggregation weights. Skipping it costs
+    /// little analytically and is the largest single item left in the round
+    /// once evaluation cadence has been reduced.
+    public let computeTrainAcc: Bool
+
+    public init(batchSize: Int, epochsPerRound: Int, learningRate: Float, seed: UInt64,
+                computeTrainAcc: Bool = true) {
         self.batchSize = batchSize
         self.epochsPerRound = epochsPerRound
         self.learningRate = learningRate
         self.seed = seed
+        self.computeTrainAcc = computeTrainAcc
     }
 }
 
 public struct EpochResult: Sendable {
     public let epoch: Int
     public let meanLoss: Float
-    public let trainAcc: Double
+    /// nil when the post-training accuracy pass was skipped.
+    ///
+    /// Optional rather than 0, for the same reason the evaluation fields are:
+    /// a model scoring zero and a model that was never scored are different
+    /// facts, and 0.0 is a value a genuinely broken model could produce. The
+    /// CSV writes nil as an empty field, which the analysis reads as missing.
+    public let trainAcc: Double?
+    /// Seconds spent on the post-training accuracy pass; 0 when skipped.
+    ///
+    /// Zero rather than nil here, because no pass ran and zero seconds is what
+    /// was measured — the same distinction the -1 sentinel draws elsewhere
+    /// between "not instrumented" and "measured as zero". Timing it also closes
+    /// the unattributed remainder that has appeared in every phase breakdown
+    /// since the project began.
+    public let trainAccS: Double
     public let batchCount: Int
     public let fwdS: Double
     public let bwdS: Double
@@ -190,24 +224,35 @@ public final class CNNTrainer {
         // gradient computation, analogous to Python's _accuracy_batched()
         // being separate from training timing. It's also not included in
         // trainTimeS (that clock stopped above), which is correct.
-        let trainAccBatchCount = shard.sampleCount / config.batchSize
-        var correct = 0
-        var total = 0
-        for batchIndex in 0..<trainAccBatchCount {
-            let batchStart = batchIndex * config.batchSize
-            let sequentialIndices = Array(batchStart..<(batchStart + config.batchSize))
-            let (images, labels) = extractBatch(shard: shard, sampleIndices: sequentialIndices)
-            let cache = model.forward(images: images)
-            for i in 0..<config.batchSize {
-                let predicted = argmax(cache.probs, row: i, cols: model.config.classes)
-                if predicted == labels[i] { correct += 1 }
-                total += 1
+        //
+        // NOW TIMED, and skippable. Previously neither: the pass ran
+        // unconditionally and its cost showed up only as the gap between round
+        // wall-clock and the sum of the logged phases.
+        var trainAcc: Double? = nil
+        var trainAccS: Double = 0
+        if config.computeTrainAcc {
+            let trainAccStart = Date()
+            let trainAccBatchCount = shard.sampleCount / config.batchSize
+            var correct = 0
+            var total = 0
+            for batchIndex in 0..<trainAccBatchCount {
+                let batchStart = batchIndex * config.batchSize
+                let sequentialIndices = Array(batchStart..<(batchStart + config.batchSize))
+                let (images, labels) = extractBatch(shard: shard, sampleIndices: sequentialIndices)
+                let cache = model.forward(images: images)
+                for i in 0..<config.batchSize {
+                    let predicted = argmax(cache.probs, row: i, cols: model.config.classes)
+                    if predicted == labels[i] { correct += 1 }
+                    total += 1
+                }
             }
+            trainAcc = total > 0 ? Double(correct) / Double(total) : 0.0
+            trainAccS = Date().timeIntervalSince(trainAccStart)
         }
-        let trainAcc = total > 0 ? Double(correct) / Double(total) : 0.0
 
         return EpochResult(
-            epoch: epoch, meanLoss: meanLoss, trainAcc: trainAcc, batchCount: batchCount,
+            epoch: epoch, meanLoss: meanLoss, trainAcc: trainAcc,
+            trainAccS: trainAccS, batchCount: batchCount,
             fwdS: totalFwdS, bwdS: totalBwdS, optS: totalOptS, shufS: totalShufS
         )
     }
@@ -246,4 +291,5 @@ public final class CNNTrainer {
         return (images, labels)
     }
 }
+
 

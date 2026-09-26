@@ -100,15 +100,42 @@ public protocol FederatedModel: Sendable {
 /// which then does gossip aggregation).
 public struct TrainEpochResult: Sendable {
     public let meanLoss: Double
-    public let trainAcc: Double
+
+    /// Accuracy on this node's own shard using PRE-aggregation weights, or nil
+    /// when the pass was skipped.
+    ///
+    /// Optional rather than 0, matching how the evaluation fields already
+    /// behave: a model scoring zero and a model that was never scored are
+    /// different facts, and 0.0 is a value a genuinely broken model produces.
+    /// The CSV writes nil as an empty field, which the analysis reads as
+    /// missing rather than as a real accuracy.
+    public let trainAcc: Double?
+
+    /// Seconds spent computing `trainAcc`; 0 when it was skipped.
+    ///
+    /// Zero rather than nil, because no pass ran and zero seconds is what was
+    /// measured — the same distinction the -1 sentinel draws elsewhere between
+    /// "not instrumented" and "measured as zero".
+    ///
+    /// This closes an unattributed remainder present since the project began.
+    /// The pass is a full sequential forward pass over the whole local shard —
+    /// the same work as an evaluation — and was never timed, so it appeared
+    /// only as an ~11s gap between round wall-clock and the sum of the logged
+    /// phases, about 12% of an 88-second round. F-001 identified it by dividing
+    /// that gap by the per-sample evaluation rate, which implied 4,963 samples
+    /// against a shard of 5,000; this measures it directly.
+    public let trainAccS: Double
+
     public let fwdS: Double
     public let bwdS: Double
     public let optS: Double
     public let shufS: Double
 
-    public init(meanLoss: Double, trainAcc: Double, fwdS: Double, bwdS: Double, optS: Double, shufS: Double) {
+    public init(meanLoss: Double, trainAcc: Double?, trainAccS: Double = 0,
+                fwdS: Double, bwdS: Double, optS: Double, shufS: Double) {
         self.meanLoss = meanLoss
         self.trainAcc = trainAcc
+        self.trainAccS = trainAccS
         self.fwdS = fwdS
         self.bwdS = bwdS
         self.optS = optS
@@ -285,4 +312,5 @@ public enum CIFAR10Shard {
         )
     }
 }
+
 

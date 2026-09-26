@@ -237,6 +237,11 @@ public struct RunConfig: Codable {
     /// rounds-to-target, which resolves only to N rounds under this setting.
     public let evalEvery: Int
 
+    /// Whether the post-training accuracy pass was skipped. Recorded because a
+    /// run without it is ~12% cheaper per round, and nothing else in the
+    /// artefacts distinguishes the two.
+    public let skipTrainAcc: Bool
+
     // Data
     public let dataDirectory: String
     public let outputDirectory: String
@@ -297,6 +302,7 @@ public struct RunConfig: Codable {
         churnSeed: UInt64 = 0,
         compression: String = "none",
         evalEvery: Int = 1,
+        skipTrainAcc: Bool = false,
         dataDirectory: String,
         outputDirectory: String,
         trainSampleCount: Int,
@@ -330,6 +336,7 @@ public struct RunConfig: Codable {
         self.churnSeed = churnSeed
         self.compression = compression
         self.evalEvery = evalEvery
+        self.skipTrainAcc = skipTrainAcc
 
         self.dataDirectory = dataDirectory
         self.outputDirectory = outputDirectory
@@ -376,6 +383,7 @@ public struct RunConfig: Codable {
         let regime = peerDeadlineSeconds.map { "deadline=\($0)s" } ?? "no-deadline"
         let comp = compression == "none" ? "" : " compression=\(compression)"
             + (evalEvery > 1 ? " eval-every=\(evalEvery)" : "")
+            + (skipTrainAcc ? " skip-train-acc" : "")
         let excl = excludedPeerIDs.isEmpty ? ""
                  : " excluded=\(excludedPeerIDs.joined(separator: ","))"
         let churn = churnDropProbability > 0 ? " churn=\(churnDropProbability)" : ""

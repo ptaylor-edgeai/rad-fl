@@ -1007,7 +1007,10 @@ public final class RoundOrchestrator {
             peersTimedOut: waitOutcome.timedOut.count,
             gossipWaitS: gossipWaitS,
             gossipAggregateS: gossipAggregateS,
-            peersChurnDropped: waitOutcome.churnDropped.count
+            peersChurnDropped: waitOutcome.churnDropped.count,
+            // Closes the unattributed remainder: the logged phases now account
+            // for the whole round.
+            trainAccS: trainResult.trainAccS
         )
     }
 

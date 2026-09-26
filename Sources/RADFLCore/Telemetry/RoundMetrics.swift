@@ -45,6 +45,10 @@
 //        gossip_agg_s keeps exactly the value it has always had, so v2 runs
 //        stay directly comparable with v3 ones. See those fields for what
 //        the previous instrumentation was actually measuring.
+//   v5 — adds train_acc_s, the post-training accuracy pass. That pass has run
+//        since the project began and was never timed; it appeared only as an
+//        unattributed remainder in every phase breakdown. train_acc itself is
+//        unchanged and remains nil when the pass is skipped.
 //   v4 — adds peers_churn_dropped, for the failure regimes. peers_timed_out
 //        (v2) becomes populated at the same time, having been a -1 sentinel
 //        until the round deadline existed to produce it.
@@ -60,7 +64,7 @@ public struct RoundMetrics: Sendable, Codable {
     /// CSV/struct schema version. Bump when columns are added so analysis code
     /// can dispatch on an explicit number rather than sniffing for the presence
     /// of a column and guessing.
-    public static let schemaVersion: Int = 4
+    public static let schemaVersion: Int = 5
 
     public let round: Int
     public let nodeID: Int
@@ -138,6 +142,15 @@ public struct RoundMetrics: Sendable, Codable {
     /// indistinguishable from a slow one — and separating those is the whole
     /// point of running a churn regime alongside a crash regime.
     public let peersChurnDropped: Int
+
+    /// Seconds spent on the post-training accuracy pass; 0 when skipped, -1 in
+    /// runs from before this was instrumented.
+    ///
+    /// With this the logged phases finally account for the whole round. The
+    /// pass costs ~11s on a 5,000-sample shard — about 12% of an 88-second
+    /// round, and the largest single item remaining once evaluation cadence has
+    /// been reduced.
+    public let trainAccS: Double
     public let roundTotalS: Double        // EXCLUDES evalTotalS — see evalTotalS's doc comment; true total wall-clock is roundTotalS + evalTotalS
 
     // Wall-clock round-end marker — Python's `timestamp` column, written by
@@ -313,7 +326,9 @@ public struct RoundMetrics: Sendable, Codable {
         gossipWaitS: Double = -1,
         gossipAggregateS: Double = -1,
         // ── schema v4 ───────────────────────────────────────────────────────
-        peersChurnDropped: Int = -1
+        peersChurnDropped: Int = -1,
+        // ── schema v5 ───────────────────────────────────────────────────────
+        trainAccS: Double = -1
     ) {
         self.round = round
         self.nodeID = nodeID
@@ -355,6 +370,7 @@ public struct RoundMetrics: Sendable, Codable {
         self.gossipWaitS = gossipWaitS
         self.gossipAggregateS = gossipAggregateS
         self.peersChurnDropped = peersChurnDropped
+        self.trainAccS = trainAccS
     }
 }
 

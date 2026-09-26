@@ -142,6 +142,21 @@ public struct SimpleCNNConfig: Sendable, Codable {
 public final class SimpleCNN: @unchecked Sendable {
     public let config: SimpleCNNConfig
 
+    /// Whether `trainEpoch` runs the post-training accuracy pass.
+    ///
+    /// A settable property rather than part of `SimpleCNNConfig` or the
+    /// `FederatedModel` protocol, for two reasons. `SimpleCNNConfig` is
+    /// `Codable` and written to config.json, so adding a field there would make
+    /// an older config.json fail to decode. And a protocol requirement cannot
+    /// carry a default argument, so widening `trainEpoch`'s signature would
+    /// break every conformer for a flag only this implementation needs.
+    ///
+    /// Set once by the caller after construction, before the round loop starts.
+    /// It is not intended to vary between rounds — a run either measures
+    /// train_acc or does not, and varying it mid-run would make the phase
+    /// breakdown incomparable across rounds of the same run.
+    public var computeTrainAcc: Bool = true
+
     var conv1W: [Float]; var conv1B: [Float]    // (c1, cIn*kH*kW), (c1,)
     var conv2W: [Float]; var conv2B: [Float]    // (c2, c1*kH*kW),  (c2,)
     var conv3W: [Float]; var conv3B: [Float]    // (c3, c2*kH*kW),  (c3,)
@@ -535,17 +550,21 @@ extension SimpleCNN: FederatedModel {
     ) throws -> TrainEpochResult {
         let trainerConfig = CNNTrainerConfig(
             batchSize: config.n, epochsPerRound: 1,
-            learningRate: learningRate, seed: seed
+            learningRate: learningRate, seed: seed,
+            computeTrainAcc: computeTrainAcc
         )
         let trainer = CNNTrainer(model: self, config: trainerConfig)
 
         let results = try trainer.trainRound(shard: shard, onBatchProgress: onBatchProgress)
         guard let result = results.first else {
-            return TrainEpochResult(meanLoss: .nan, trainAcc: 0, fwdS: 0, bwdS: 0, optS: 0, shufS: 0)
+            // nil, not 0: no epoch ran, so there is no accuracy to report.
+            return TrainEpochResult(meanLoss: .nan, trainAcc: nil, trainAccS: 0,
+                                    fwdS: 0, bwdS: 0, optS: 0, shufS: 0)
         }
         return TrainEpochResult(
             meanLoss: Double(result.meanLoss),
             trainAcc: result.trainAcc,
+            trainAccS: result.trainAccS,
             fwdS: result.fwdS, bwdS: result.bwdS, optS: result.optS, shufS: result.shufS
         )
     }
@@ -699,4 +718,5 @@ public struct SplitMix64 {
         Double(next() >> 11) * (1.0 / Double(1 << 53))
     }
 }
+
 

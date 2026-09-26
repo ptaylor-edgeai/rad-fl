@@ -139,7 +139,7 @@ struct RADFLMain {
                             compiler — this is the first real check of its correctness,
                             the same way test-cnn was for Tensor.swift's other primitives.)
                            [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--batch-size <n>] [--output-dir <path>]
-                           [--compression none|fp16|int8] [--eval-every <n>]
+                           [--compression none|fp16|int8] [--eval-every <n>] [--skip-train-acc]
                            [--peer-deadline-s <f>] [--startup-deadline-s <f>] [--push-retry-s <f>]
                            [--churn-drop <p>] [--churn-seed <n>]
                            (runs the FULL federated learning loop for real, on real
@@ -183,6 +183,11 @@ struct RADFLMain {
                             sentinel means NOT INSTRUMENTED, explicitly distinct from a
                             measured zero; see RoundMetrics.swift. Defaults: 5 rounds,
                             learning rate 0.01, batch size 32, seed 42.
+                            --skip-train-acc omits the post-training accuracy pass, a full
+                            forward pass over the local shard costing ~12% of a round. It is
+                            a diagnostic: local_acc measures nearly the same quantity, on
+                            post-aggregation rather than pre-aggregation weights. train_acc
+                            is then empty and train_acc_s is zero.
                             EVALUATION CADENCE: --eval-every N evaluates the test set and
                             local shard every N rounds instead of every round; the final
                             round is always evaluated. Evaluation is half of every round
@@ -582,6 +587,11 @@ struct RADFLMain {
                 // Evaluation cadence. Rejected rather than clamped on a bad value,
                 // for the same reason as --compression: a silent fallback to 1
                 // would produce a run labelled as reduced-cadence that was not.
+                // The post-training accuracy pass is a diagnostic: local_acc
+                // measures nearly the same quantity on post-aggregation
+                // weights. Skipping it removes ~12% of a round.
+                let skipTrainAcc = args.contains("--skip-train-acc")
+
                 let evalEveryArg = arg("--eval-every", in: args) ?? "1"
                 guard let evalEvery = Int(evalEveryArg), evalEvery >= 1 else {
                     FileHandle.standardError.write(Data(
@@ -698,6 +708,11 @@ struct RADFLMain {
                 // CNNTrainer/train-cnn's own default elsewhere in this file).
                 let modelConfig = SimpleCNNConfig(n: batchSize)
                 let model = SimpleCNN(config: modelConfig, seed: seed)
+                // Set once, before the round loop. Not varied between rounds:
+                // a run either measures train_acc or does not, and changing it
+                // mid-run would make the phase breakdown incomparable across
+                // rounds of the same run.
+                model.computeTrainAcc = !skipTrainAcc
 
                 let collector = InboundUpdateCollector()
                 let client = GossipClient(group: group)
@@ -910,6 +925,7 @@ struct RADFLMain {
                     churnSeed: churnSeed,
                     compression: compressionArg,
                     evalEvery: evalEvery,
+                    skipTrainAcc: skipTrainAcc,
                     dataDirectory: dataDir.path,
                     outputDirectory: outputDir.path,
                     trainSampleCount: trainShard.sampleCount,
