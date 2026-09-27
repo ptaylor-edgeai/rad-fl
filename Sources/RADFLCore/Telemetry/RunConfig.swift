@@ -242,6 +242,11 @@ public struct RunConfig: Codable {
     /// artefacts distinguishes the two.
     public let skipTrainAcc: Bool
 
+    /// Sparsification fraction, and whether dropped values are carried
+    /// forward. Only meaningful when compression is topk.
+    public let topKRatio: Double
+    public let errorFeedback: Bool
+
     // Data
     public let dataDirectory: String
     public let outputDirectory: String
@@ -303,6 +308,8 @@ public struct RunConfig: Codable {
         compression: String = "none",
         evalEvery: Int = 1,
         skipTrainAcc: Bool = false,
+        topKRatio: Double = 0.1,
+        errorFeedback: Bool = true,
         dataDirectory: String,
         outputDirectory: String,
         trainSampleCount: Int,
@@ -337,6 +344,8 @@ public struct RunConfig: Codable {
         self.compression = compression
         self.evalEvery = evalEvery
         self.skipTrainAcc = skipTrainAcc
+        self.topKRatio = topKRatio
+        self.errorFeedback = errorFeedback
 
         self.dataDirectory = dataDirectory
         self.outputDirectory = outputDirectory
@@ -384,6 +393,8 @@ public struct RunConfig: Codable {
         let comp = compression == "none" ? "" : " compression=\(compression)"
             + (evalEvery > 1 ? " eval-every=\(evalEvery)" : "")
             + (skipTrainAcc ? " skip-train-acc" : "")
+            + (compression == "topk"
+               ? " k=\(topKRatio)\(errorFeedback ? "" : " no-ef")" : "")
         let excl = excludedPeerIDs.isEmpty ? ""
                  : " excluded=\(excludedPeerIDs.joined(separator: ","))"
         let churn = churnDropProbability > 0 ? " churn=\(churnDropProbability)" : ""

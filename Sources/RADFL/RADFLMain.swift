@@ -139,7 +139,8 @@ struct RADFLMain {
                             compiler — this is the first real check of its correctness,
                             the same way test-cnn was for Tensor.swift's other primitives.)
                            [--rounds <n>] [--learning-rate <f>] [--seed <n>] [--batch-size <n>] [--output-dir <path>]
-                           [--compression none|fp16|int8] [--eval-every <n>] [--skip-train-acc]
+                           [--compression none|fp16|int8|topk] [--topk-ratio <f>] [--no-error-feedback]
+                           [--eval-every <n>] [--skip-train-acc]
                            [--peer-deadline-s <f>] [--startup-deadline-s <f>] [--push-retry-s <f>]
                            [--churn-drop <p>] [--churn-seed <n>]
                            (runs the FULL federated learning loop for real, on real
@@ -195,6 +196,18 @@ struct RADFLMain {
                             energy in proportion to time — unlike reducing communication,
                             whose time was spent near idle. Accuracy is empty on skipped
                             rounds; evaluation time is recorded as zero.
+                            SPARSIFICATION: --compression topk transmits only the largest
+                            --topk-ratio fraction of each tensor's CHANGE since the last
+                            aggregation, not of the weights themselves: a receiver fills
+                            zeros for untransmitted positions, so sparsifying absolute
+                            weights would halve every parameter outside the top-k. Deltas
+                            are reconstructed against the receiver's own post-aggregation
+                            state, which requires full mesh — under a sparse topology nodes
+                            do not share that state. Round 1 always sends full weights, and
+                            any peer loss reverts the run to full weights permanently, since
+                            the shared base is then gone. --no-error-feedback drops the
+                            residual instead of carrying it forward; that is the ablation
+                            arm, and it diverges under skew by design.
                             COMPRESSION: --compression selects how parameter tensors are
                             encoded for transmission. fp16 halves the payload at ~2e-04 max
                             error; int8 quarters it at ~4e-03. Both are lossy and apply to
@@ -599,21 +612,27 @@ struct RADFLMain {
                     exit(2)
                 }
 
+                // Sparsification parameters. Only meaningful with --compression topk.
+                let topKRatio = Double(arg("--topk-ratio", in: args) ?? "0.1") ?? 0.1
+                guard topKRatio > 0, topKRatio <= 1 else {
+                    FileHandle.standardError.write(Data(
+                        "error: --topk-ratio must be in (0, 1]\n".utf8))
+                    exit(2)
+                }
+                // Default ON: disabling it is the experimental arm, not the
+                // sensible default. Without error feedback a parameter whose
+                // update is consistently below the threshold is never
+                // transmitted at all, which diverges under label skew rather
+                // than merely converging slowly.
+                let errorFeedback = !args.contains("--no-error-feedback")
+
                 let compressionArg = (arg("--compression", in: args) ?? "none").lowercased()
                 let compression: GossipEncoding
                 switch compressionArg {
                 case "none", "dense": compression = .dense
                 case "fp16":          compression = .denseFP16
                 case "int8":          compression = .denseINT8
-                case "topk":
-                    FileHandle.standardError.write(Data(
-                        ("error: --compression topk is not implemented.\n"
-                         + "  Sparsification cannot be applied to full weights: a receiver\n"
-                         + "  fills zeros for untransmitted positions, and sample-weighted\n"
-                         + "  averaging then halves every parameter outside the top-k.\n"
-                         + "  It requires delta mode, where untransmitted positions fall back\n"
-                         + "  to the last agreed state. Not yet built.\n").utf8))
-                    exit(2)
+                case "topk":  compression = .sparseCOO
                 default:
                     FileHandle.standardError.write(Data(
                         "error: unknown --compression '\(compressionArg)' — expected none|fp16|int8\n".utf8))
@@ -731,7 +750,9 @@ struct RADFLMain {
                     churnSeed: churnSeed,
                     pushRetrySeconds: pushRetry,
                     compression: compression,
-                    evalEvery: evalEvery
+                    evalEvery: evalEvery,
+                    topKRatio: topKRatio,
+                    errorFeedback: errorFeedback
                 )
                 if let peerDeadline {
                     print("[run-round] peer deadline \(peerDeadline)s — rounds will "
@@ -926,6 +947,8 @@ struct RADFLMain {
                     compression: compressionArg,
                     evalEvery: evalEvery,
                     skipTrainAcc: skipTrainAcc,
+                    topKRatio: topKRatio,
+                    errorFeedback: errorFeedback,
                     dataDirectory: dataDir.path,
                     outputDirectory: outputDir.path,
                     trainSampleCount: trainShard.sampleCount,

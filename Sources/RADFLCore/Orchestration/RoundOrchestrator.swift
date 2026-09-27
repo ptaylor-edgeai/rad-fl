@@ -248,6 +248,23 @@ public struct RoundOrchestratorConfig: Sendable {
     /// so at round 15. Report the cadence alongside any convergence figure.
     public let evalEvery: Int
 
+    /// Fraction of each tensor's elements transmitted under `.sparseCOO`.
+    ///
+    /// Only meaningful with sparsification. Sparse costs 8 bytes per nonzero
+    /// against dense's 4 per element, so it is larger than dense above ~50%
+    /// density — `TensorCodec.encodedByteCount` makes that checkable.
+    public let topKRatio: Double
+
+    /// Whether values dropped by sparsification are carried into the next
+    /// round's update.
+    ///
+    /// Without it, a parameter whose update is consistently below the
+    /// threshold is never transmitted at all — not merely transmitted slowly.
+    /// Under label skew that diverges rather than converging slowly, which is
+    /// the effect the ablation exists to measure. Default on: off is the
+    /// experimental arm, not the sensible default.
+    public let errorFeedback: Bool
+
     public init(totalRounds: Int, condition: String, baseSeed: UInt64,
                 learningRate: Float, heartbeatIntervalSeconds: Double = 20,
                 peerDeadlineSeconds: Double? = nil,
@@ -255,7 +272,9 @@ public struct RoundOrchestratorConfig: Sendable {
                 churnSeed: UInt64 = 0,
                 pushRetrySeconds: Double? = nil,
                 compression: GossipEncoding = .dense,
-                evalEvery: Int = 1) {
+                evalEvery: Int = 1,
+                topKRatio: Double = 0.1,
+                errorFeedback: Bool = true) {
         self.totalRounds = totalRounds
         self.condition = condition
         self.baseSeed = baseSeed
@@ -267,6 +286,8 @@ public struct RoundOrchestratorConfig: Sendable {
         self.pushRetrySeconds = pushRetrySeconds
         self.compression = compression
         self.evalEvery = max(1, evalEvery)
+        self.topKRatio = min(1.0, max(0.0001, topKRatio))
+        self.errorFeedback = errorFeedback
     }
 
     /// Whether `round` is evaluated. Rounds are 1-based; the final round is
@@ -352,6 +373,41 @@ public final class RoundOrchestrator {
     /// round iterates peers, so an excluded node is neither pushed to nor
     /// waited for.
     private var activePeers: [TopologyNode]
+
+    // ── Delta-mode state ────────────────────────────────────────────────────
+    //
+    // Sparsification cannot be applied to full weights: a receiver fills zeros
+    // for untransmitted positions and sample-weighted averaging then halves
+    // every parameter outside the top-k. Simulated at 10% density, mean
+    // aggregate error is 0.0859 against 0.0030 for the same sparsification
+    // applied to a delta. It must therefore apply to the CHANGE since the last
+    // aggregation, so untransmitted positions fall back to the last agreed
+    // state rather than to zero.
+    //
+    // That requires the receiver to know what state to add a delta to. Under
+    // full mesh it does: after aggregation every node holds the same weights to
+    // within ~1e-7 (F-009), so a node reconstructs a peer's weights from its
+    // OWN post-aggregation state. Under a sparse topology it does not —
+    // cross-node spread has been measured at 0.0163 to 0.0963 — which is why
+    // compression and topology cannot be combined without revisiting this.
+
+    /// This node's weights immediately after the previous round's aggregation:
+    /// the base every peer's delta is measured against, and the base this node
+    /// adds an incoming delta to. nil before round 1 has aggregated.
+    private var lastAggregated: [[Float]]?
+
+    /// Values sparsification dropped, owed to the next round's update.
+    private var residual: [[Float]]?
+
+    /// Set permanently once any peer has timed out.
+    ///
+    /// A timeout means this node aggregated a different set from its peers, so
+    /// the shared base is gone and every subsequent delta would be applied to
+    /// the wrong weights — silently, producing a plausible but wrong model.
+    /// Reverting to full-weight sends costs bytes and restores correctness,
+    /// because a full weight message needs no base at all. Permanent rather
+    /// than per-round: once the bases have diverged they do not reconverge.
+    private var deltaFallback = false
     private let onTrainingProgress: (@Sendable (_ round: Int, _ batchIndex: Int, _ totalBatches: Int) -> Void)?
 
     public init(
@@ -479,6 +535,112 @@ public final class RoundOrchestrator {
                 backoff = min(backoff * 2, 5_000_000_000)
             }
         }
+    }
+
+    /// Builds this round's outgoing tensors and the message type that
+    /// describes them.
+    ///
+    /// Returns full weights unless sparsification is configured AND a shared
+    /// base exists AND no peer has been lost. Any of those failing means a
+    /// delta would be applied to the wrong weights by somebody, so the safe
+    /// form is sent instead.
+    private func buildOutgoingTensors(_ myParameters: [[Float]])
+        -> ([GossipTensor], GossipMessageType) {
+
+        guard config.compression == .sparseCOO,
+              !deltaFallback,
+              let base = lastAggregated,
+              base.count == myParameters.count else {
+            // Round 1 always lands here: there is no previous aggregation to
+            // measure a change against, so the first message is necessarily
+            // the full weights whatever the mechanism.
+            return (myParameters.enumerated().map {
+                GossipTensor(tensorID: UInt32($0.offset), values: $0.element,
+                             encoding: config.compression == .sparseCOO
+                                       ? .dense : config.compression)
+            }, .weightsFull)
+        }
+
+        var tensors: [GossipTensor] = []
+        tensors.reserveCapacity(myParameters.count)
+        var nextResidual: [[Float]] = []
+        nextResidual.reserveCapacity(myParameters.count)
+
+        for (i, current) in myParameters.enumerated() {
+            guard current.count == base[i].count else {
+                // Shape changed underneath us: fall back rather than produce a
+                // delta against a mismatched base.
+                return (myParameters.enumerated().map {
+                    GossipTensor(tensorID: UInt32($0.offset), values: $0.element)
+                }, .weightsFull)
+            }
+
+            // The change since the last aggregation, plus whatever the previous
+            // round dropped. Error feedback is what stops a consistently small
+            // update from never being transmitted at all: without it, a
+            // parameter below the threshold is silently frozen rather than
+            // merely slow, which diverges under label skew.
+            var delta = [Float](repeating: 0, count: current.count)
+            let owed = (config.errorFeedback && residual?.count == myParameters.count)
+                       ? residual![i] : nil
+            for j in 0..<current.count {
+                delta[j] = current[j] - base[i][j] + (owed?[j] ?? 0)
+            }
+
+            let k = max(1, Int((Double(delta.count) * config.topKRatio).rounded()))
+            let (sparse, dropped) = TensorCodec.topK(delta, k: k)
+
+            // Sent dense-shaped with dropped positions zeroed; the codec derives
+            // the indices. Keeps the in-memory shape identical for every
+            // encoding — see GossipTensor's own note.
+            tensors.append(GossipTensor(tensorID: UInt32(i),
+                                        values: TensorCodec.fromSparse(sparse),
+                                        encoding: .sparseCOO))
+            nextResidual.append(config.errorFeedback ? dropped
+                                : [Float](repeating: 0, count: current.count))
+        }
+
+        residual = nextResidual
+        return (tensors, .weightsDelta)
+    }
+
+    /// Turns one peer's message into dense parameters.
+    ///
+    /// A `.weightsDelta` message carries the peer's CHANGE since the last
+    /// aggregation, so it is added to this node's own post-aggregation state —
+    /// the same state the sender measured against, to within float32 reduction
+    /// noise. A `.weightsFull` message is used as it stands, which is what lets
+    /// a peer that has reverted to full weights interoperate with one that has
+    /// not.
+    private func reconstruct(message: GossipMessage, senderID: UInt32,
+                             expectedTensorCount: Int) throws -> [[Float]] {
+        let ordered = message.tensors.sorted { $0.tensorID < $1.tensorID }.map(\.values)
+        guard message.messageType == .weightsDelta else { return ordered }
+
+        // A delta with no base cannot be reconstructed. Rather than guess —
+        // treating it as absolute weights would be wrong by exactly the base —
+        // this is a hard error: it means a peer believes a shared base exists
+        // when this node has none, which is a protocol disagreement rather
+        // than a recoverable condition.
+        guard let base = lastAggregated, base.count == expectedTensorCount else {
+            throw RoundOrchestratorError.malformedPeerMessage(
+                senderID: senderID, expectedTensorCount: expectedTensorCount,
+                gotTensorCount: ordered.count)
+        }
+
+        var out: [[Float]] = []
+        out.reserveCapacity(ordered.count)
+        for (i, delta) in ordered.enumerated() {
+            guard delta.count == base[i].count else {
+                throw RoundOrchestratorError.malformedPeerMessage(
+                    senderID: senderID, expectedTensorCount: base[i].count,
+                    gotTensorCount: delta.count)
+            }
+            var reconstructed = [Float](repeating: 0, count: delta.count)
+            for j in 0..<delta.count { reconstructed[j] = base[i][j] + delta[j] }
+            out.append(reconstructed)
+        }
+        return out
     }
 
     /// Runs `body` only when `flag` is set, otherwise returns nil.
@@ -643,20 +805,18 @@ public final class RoundOrchestrator {
         // a function parameter already in scope from the start of this
         // method, so this is a safe reordering, not a new dependency.
         let localSampleCount = trainShard.sampleCount
+        // The compression policy applies HERE and nowhere else. Every encoding
+        // decodes back to a dense array, so nothing downstream —
+        // GossipAggregator, the model, the round loop — is aware a mechanism is
+        // in use. A compressed run and a dense run differ in exactly one field
+        // on the wire, plus the message type when sending deltas.
+        let (outgoingTensors, outgoingType) = buildOutgoingTensors(myParameters)
         let outgoingMessage = GossipMessage(
-            messageType: .weightsFull,
+            messageType: outgoingType,
             senderNodeID: localNumericID,
             round: UInt32(round),
             sampleCount: UInt32(localSampleCount),
-            // The compression policy applies HERE and nowhere else. Every
-            // encoding decodes back to a dense array, so nothing downstream —
-            // GossipAggregator, the model, the round loop — is aware a
-            // mechanism is in use. A compressed run and a dense run differ in
-            // exactly one field on the wire.
-            tensors: myParameters.enumerated().map {
-                GossipTensor(tensorID: UInt32($0.offset), values: $0.element,
-                             encoding: config.compression)
-            }
+            tensors: outgoingTensors
         )
 
         // Byte count computed ONCE per round (not per-peer) — the message
@@ -798,6 +958,21 @@ public final class RoundOrchestrator {
         // from a number.
         logPeerLosses(round: round, outcome: waitOutcome, waitedS: gossipWaitS)
 
+        // A timeout means this node aggregated a different set from its peers,
+        // so the shared base deltas depend on is gone. Continuing to send them
+        // would apply each one to the wrong weights — silently, producing a
+        // plausible but wrong model. Full-weight sends need no base, so
+        // reverting restores correctness at the cost of bytes.
+        if !deltaFallback && (!waitOutcome.timedOut.isEmpty
+                              || !waitOutcome.churnDropped.isEmpty) {
+            deltaFallback = true
+            if config.compression == .sparseCOO {
+                print("[round \(round)] peer(s) lost — reverting to full-weight "
+                      + "sends for the rest of this run. Deltas need a base "
+                      + "shared with every peer, and that base has diverged.")
+            }
+        }
+
         let failedPushes = try await pushOutcome
         if !failedPushes.isEmpty {
             print("[round \(round)] push failed to \(failedPushes.count) peer(s) after "
@@ -888,7 +1063,15 @@ public final class RoundOrchestrator {
                 // gossip.py exactly: num_samples is transmitted over the
                 // wire by each sender, never assumed by the receiver.
                 sampleCount: Int(message.sampleCount),
-                parameters: message.tensors.sorted { $0.tensorID < $1.tensorID }.map(\.values)
+                // A delta is reconstructed against THIS node's own
+                // post-aggregation state, which is the same state the sender
+                // measured against — see the delta-mode notes on
+                // `lastAggregated`. A full-weight message needs no base and is
+                // used as it stands, so a peer that has fallen back to full
+                // weights interoperates with one that has not.
+                parameters: try reconstruct(
+                    message: message, senderID: senderID,
+                    expectedTensorCount: expectedTensorCount)
             ))
         }
         // Real per-peer sample counts (see comment above) — this gap is
@@ -897,6 +1080,12 @@ public final class RoundOrchestrator {
         // shard size, matching Python's gossip.py exactly.
         let aggregated = GossipAggregator.aggregate(localUpdate: localUpdate, peerUpdates: peerUpdateList)
         model.setParameters(aggregated)
+
+        // The base for next round's deltas, in both directions: what this node
+        // will measure its own change against, and what it will add an
+        // incoming delta to. Stored unconditionally — cheap, and it means
+        // enabling sparsification mid-run would not need a warm-up round.
+        lastAggregated = aggregated
 
         // Closes the window opened at `aggregateStart`. Deliberately includes
         // PeerUpdate construction and validation as well as the arithmetic:
