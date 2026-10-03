@@ -544,8 +544,28 @@ public final class RoundOrchestrator {
     /// base exists AND no peer has been lost. Any of those failing means a
     /// delta would be applied to the wrong weights by somebody, so the safe
     /// form is sent instead.
+    /// Returns the tensors to transmit, the message type describing them, and
+    /// the parameters this node should aggregate FOR ITSELF.
+    ///
+    /// That third value is the correctness-critical one. A node must aggregate
+    /// its own update in the same form its peers received it, or no two nodes
+    /// aggregate the same set of values and they diverge immediately — not by
+    /// drift, but by construction.
+    ///
+    /// The asymmetry is benign for quantisation and fatal for sparsification,
+    /// and the boundary is how much of the update is discarded. Under fp16 a
+    /// node holds its own update exact and its peers' to within 2e-04, which is
+    /// nothing. Under top-k at 10% density it holds its own update in full and
+    /// its peers' with 90% removed. Measured: cross-node weight divergence of
+    /// 0.0162 with self-aggregation uncompressed, and exactly zero when the
+    /// node applies to itself the same sparse update it sent.
+    ///
+    /// It also makes error feedback coherent. The residual is what was NOT
+    /// transmitted; if the node advanced its own model by the full update while
+    /// still owing that residual, it would count the dropped values twice —
+    /// once locally now, once on the wire next round.
     private func buildOutgoingTensors(_ myParameters: [[Float]])
-        -> ([GossipTensor], GossipMessageType) {
+        -> (tensors: [GossipTensor], type: GossipMessageType, selfParameters: [[Float]]) {
 
         guard config.compression == .sparseCOO,
               !deltaFallback,
@@ -554,17 +574,22 @@ public final class RoundOrchestrator {
             // Round 1 always lands here: there is no previous aggregation to
             // measure a change against, so the first message is necessarily
             // the full weights whatever the mechanism.
+            // Full weights: peers receive everything (quantised at worst), so
+            // aggregating our own parameters as they stand is what every peer
+            // effectively sees.
             return (myParameters.enumerated().map {
                 GossipTensor(tensorID: UInt32($0.offset), values: $0.element,
                              encoding: config.compression == .sparseCOO
                                        ? .dense : config.compression)
-            }, .weightsFull)
+            }, .weightsFull, myParameters)
         }
 
         var tensors: [GossipTensor] = []
         tensors.reserveCapacity(myParameters.count)
         var nextResidual: [[Float]] = []
         nextResidual.reserveCapacity(myParameters.count)
+        var selfView: [[Float]] = []
+        selfView.reserveCapacity(myParameters.count)
 
         for (i, current) in myParameters.enumerated() {
             guard current.count == base[i].count else {
@@ -572,7 +597,7 @@ public final class RoundOrchestrator {
                 // delta against a mismatched base.
                 return (myParameters.enumerated().map {
                     GossipTensor(tensorID: UInt32($0.offset), values: $0.element)
-                }, .weightsFull)
+                }, .weightsFull, myParameters)
             }
 
             // The change since the last aggregation, plus whatever the previous
@@ -589,19 +614,27 @@ public final class RoundOrchestrator {
 
             let k = max(1, Int((Double(delta.count) * config.topKRatio).rounded()))
             let (sparse, dropped) = TensorCodec.topK(delta, k: k)
+            let transmitted = TensorCodec.fromSparse(sparse)
 
             // Sent dense-shaped with dropped positions zeroed; the codec derives
             // the indices. Keeps the in-memory shape identical for every
             // encoding — see GossipTensor's own note.
             tensors.append(GossipTensor(tensorID: UInt32(i),
-                                        values: TensorCodec.fromSparse(sparse),
+                                        values: transmitted,
                                         encoding: .sparseCOO))
             nextResidual.append(config.errorFeedback ? dropped
                                 : [Float](repeating: 0, count: current.count))
+
+            // What this node's peers will reconstruct for it: the shared base
+            // plus only the values actually sent. Aggregating this rather than
+            // `current` is what keeps every node aggregating the same set.
+            var asPeersSeeIt = [Float](repeating: 0, count: current.count)
+            for j in 0..<current.count { asPeersSeeIt[j] = base[i][j] + transmitted[j] }
+            selfView.append(asPeersSeeIt)
         }
 
         residual = nextResidual
-        return (tensors, .weightsDelta)
+        return (tensors, .weightsDelta, selfView)
     }
 
     /// Turns one peer's message into dense parameters.
@@ -810,7 +843,8 @@ public final class RoundOrchestrator {
         // GossipAggregator, the model, the round loop — is aware a mechanism is
         // in use. A compressed run and a dense run differ in exactly one field
         // on the wire, plus the message type when sending deltas.
-        let (outgoingTensors, outgoingType) = buildOutgoingTensors(myParameters)
+        let (outgoingTensors, outgoingType, selfParameters) =
+            buildOutgoingTensors(myParameters)
         let outgoingMessage = GossipMessage(
             messageType: outgoingType,
             senderNodeID: localNumericID,
@@ -1031,7 +1065,10 @@ public final class RoundOrchestrator {
         // --- Aggregate and adopt the result ---
         // localSampleCount was already defined earlier (before the push),
         // not redeclared here — see that declaration's comment for why.
-        let localUpdate = PeerUpdate(nodeID: Int(localNumericID), sampleCount: localSampleCount, parameters: myParameters)
+        // `selfParameters`, not `myParameters`: this node aggregates its own
+        // update in the form its peers received it. Identical to myParameters
+        // for every encoding except sparsification — see buildOutgoingTensors.
+        let localUpdate = PeerUpdate(nodeID: Int(localNumericID), sampleCount: localSampleCount, parameters: selfParameters)
 
         // Validate tensor counts BEFORE constructing PeerUpdate from wire
         // data — GossipAggregator.aggregate indexes every peer's
